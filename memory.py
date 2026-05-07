@@ -100,6 +100,14 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "slot_fills", "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
 
     # Unique constraint so store_slot_fill can upsert instead of always inserting.
+    # Must deduplicate first — old insert-always behaviour may have left multiple
+    # rows per (project_id, slot_name); SQLite rejects the index if they exist.
+    conn.execute(
+        """DELETE FROM slot_fills
+           WHERE id NOT IN (
+               SELECT MAX(id) FROM slot_fills GROUP BY project_id, slot_name
+           )"""
+    )
     try:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_slot_fills_project_slot "

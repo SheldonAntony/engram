@@ -4,14 +4,13 @@
 Used by memory.py and tasks.py to avoid duplicating model initialization.
 """
 
-from fastembed import TextEmbedding
-
 _embedding_model = None
 
 
-def get_embedding_model() -> TextEmbedding:
+def get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
+        from fastembed import TextEmbedding  # lazy: only loaded when embeddings are needed
         _embedding_model = TextEmbedding()
     return _embedding_model
 
