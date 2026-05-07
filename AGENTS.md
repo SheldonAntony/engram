@@ -20,3 +20,19 @@ During the session:
 Do not ask for slots already returned in the `slots` field of `get_context`.
 Do not call `get_context` more than once per session unless the conversation
 window is compacted (in which case call it again on the next message).
+
+### Auto extraction
+After every response you give, call `auto_extract` with:
+- response_text: your full response text
+- project_id: current project id
+- session_id: current session id
+
+Always. No exceptions. This is non-blocking and takes under 1 second.
+It automatically saves any important facts from your response without
+you having to identify them manually.
+
+### Graph queries
+When the user asks WHY something was decided, or HOW a bug was caused,
+or what is RELATED to a topic — call `get_graph` instead of `get_context`.
+It returns connected facts (graph neighbours), not just similar ones.
+This gives richer context for causal or relational questions.

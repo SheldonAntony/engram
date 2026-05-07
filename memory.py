@@ -11,6 +11,9 @@ CLI usage:
     memory.py session_seen        <session_id>
     memory.py session_mark        <session_id> <project_id>
     memory.py session_unmark      <session_id>
+    memory.py link_facts          <fact_id_a> <fact_id_b> <relation> <strength>
+    memory.py get_related         <fact_id> [depth]
+    memory.py get_graph           <project_id> <query>
 """
 
 import json
@@ -38,6 +41,18 @@ _DECAY_RATES: dict[str, float] = {
 # Similarity threshold above which a new fact is treated as a contradiction
 # / near-duplicate of an existing one and replaces it instead of inserting.
 _CONTRADICTION_THRESHOLD = 0.88
+
+# Minimum similarity for an auto-created graph edge between two facts.
+_RELATION_THRESHOLD = 0.65
+
+# Relation type weights (used as default strength when auto-detected).
+RELATION_TYPES: dict[str, float] = {
+    "caused_by":   0.9,
+    "fixed_by":    0.9,
+    "related":     0.7,
+    "contradicts": 0.8,
+    "depends_on":  0.8,
+}
 
 
 # ─── Database init ────────────────────────────────────────────────────────────
@@ -116,6 +131,27 @@ def init_db() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # index already exists
 
+    # ── Memory graph ──────────────────────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fact_relations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_id_a   INTEGER NOT NULL,
+            fact_id_b   INTEGER NOT NULL,
+            relation    TEXT DEFAULT 'related',
+            strength    REAL DEFAULT 0.0,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (fact_id_a) REFERENCES facts(id),
+            FOREIGN KEY (fact_id_b) REFERENCES facts(id),
+            UNIQUE(fact_id_a, fact_id_b)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_relations_a ON fact_relations(fact_id_a)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_relations_b ON fact_relations(fact_id_b)"
+    )
+
     # Backfill FTS5 index from any pre-existing facts (one-time, cheap if empty).
     fts_count = conn.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
     facts_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
@@ -150,6 +186,121 @@ def mark_stored(key: str) -> None:
     conn.execute("INSERT OR IGNORE INTO dedup (key) VALUES (?)", (key,))
     conn.commit()
     conn.close()
+
+
+# ─── Memory graph ───────────────────────────────────────────────────────────
+
+def _infer_relation(content_a: str, content_b: str, similarity: float) -> str:
+    """Infer an edge label from keyword signals in the two fact texts."""
+    both = (content_a + " " + content_b).lower()
+    if any(k in both for k in ("switch", "migrat", "replac", "instead of")):
+        return "contradicts"
+    if any(k in both for k in ("fix", "solve", "resolv", "patch")):
+        return "fixed_by"
+    if any(k in both for k in ("caus", "because", "due to", "result")):
+        return "caused_by"
+    if any(k in both for k in ("depend", "require", "need", "use")):
+        return "depends_on"
+    return "related"
+
+
+def link_facts(
+    fact_id_a: int,
+    fact_id_b: int,
+    relation: str = "related",
+    strength: float = 0.0,
+) -> None:
+    """Create a directed edge between two facts (INSERT OR IGNORE — idempotent)."""
+    conn = init_db()
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO fact_relations
+               (fact_id_a, fact_id_b, relation, strength)
+               VALUES (?, ?, ?, ?)""",
+            (fact_id_a, fact_id_b, relation, strength),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_related_facts(fact_id: int, depth: int = 1) -> list[dict]:
+    """BFS over the graph starting from fact_id, up to `depth` hops.
+
+    depth=1 returns direct neighbours; depth=2 returns neighbours of neighbours.
+    Capped at 2 to avoid context explosion.
+    """
+    depth = min(depth, 2)
+    conn = init_db()
+    visited: set[int] = {fact_id}
+    results: list[dict] = []
+    queue: list[int] = [fact_id]
+
+    for _ in range(depth):
+        next_queue: list[int] = []
+        for fid in queue:
+            rows = conn.execute(
+                """SELECT f.id, f.content, f.fact_type, r.relation, r.strength
+                   FROM fact_relations r
+                   JOIN facts f ON (
+                       CASE WHEN r.fact_id_a = ? THEN r.fact_id_b
+                            ELSE r.fact_id_a END = f.id
+                   )
+                   WHERE r.fact_id_a = ? OR r.fact_id_b = ?
+                   ORDER BY r.strength DESC""",
+                (fid, fid, fid),
+            ).fetchall()
+            for row_id, content, fact_type, relation, strength in rows:
+                if row_id not in visited:
+                    visited.add(row_id)
+                    next_queue.append(row_id)
+                    results.append({
+                        "id": row_id,
+                        "content": content,
+                        "fact_type": fact_type,
+                        "relation": relation,
+                        "strength": strength,
+                    })
+        queue = next_queue
+
+    conn.close()
+    return results
+
+
+def get_graph(project_id: str, query: str, depth: int = 1) -> dict:
+    """Find the closest fact for `query` and return it with its graph neighbourhood."""
+    conn = init_db()
+    cursor = conn.execute(
+        "SELECT id, content, embedding FROM facts WHERE project_id = ? ORDER BY id DESC LIMIT 200",
+        (project_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return {"root": None, "neighbours": []}
+
+    query_emb = embed_text(query)
+    best_id, best_content, best_sim = None, "", 0.0
+    for fid, content, emb_json in rows:
+        if not emb_json:
+            continue
+        try:
+            emb = json.loads(emb_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        sim = cosine_similarity(query_emb, emb)
+        if sim > best_sim:
+            best_sim, best_id, best_content = sim, fid, content
+
+    if best_id is None:
+        return {"root": None, "neighbours": []}
+
+    neighbours = get_related_facts(best_id, depth=depth)
+    return {
+        "root": {"id": best_id, "content": best_content, "similarity": round(best_sim, 4)},
+        "neighbours": neighbours,
+    }
 
 
 # ─── Facts (semantic memory) ──────────────────────────────────────────────────
@@ -203,17 +354,45 @@ def store_fact(project_id: str, session_id: str, text: str,
             "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
             (best_id, text),
         )
+        saved_id = best_id
     else:
         cur = conn.execute(
             """INSERT INTO facts (project_id, session_id, content, embedding, fact_type)
                VALUES (?, ?, ?, ?, ?)""",
             (project_id, session_id, text, json.dumps(emb), fact_type),
         )
-        new_id = cur.lastrowid
+        saved_id = cur.lastrowid
         conn.execute(
             "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
-            (new_id, text),
+            (saved_id, text),
         )
+
+    # ── Auto-link: create graph edges to semantically related existing facts ──
+    # Re-scan (now excluding the saved row itself) to find edges ≥ threshold.
+    link_cursor = conn.execute(
+        """SELECT id, content, embedding FROM facts
+           WHERE project_id = ? AND id != ?
+           ORDER BY id DESC LIMIT 50""",
+        (project_id, saved_id),
+    )
+    for neighbor_id, neighbor_content, neighbor_emb_json in link_cursor.fetchall():
+        if not neighbor_emb_json:
+            continue
+        try:
+            neighbor_emb = json.loads(neighbor_emb_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        sim = cosine_similarity(emb, neighbor_emb)
+        if sim >= _RELATION_THRESHOLD:
+            relation = _infer_relation(text, neighbor_content, sim)
+            # Store edge with smaller id first for canonical dedup
+            id_a, id_b = min(saved_id, neighbor_id), max(saved_id, neighbor_id)
+            conn.execute(
+                """INSERT OR IGNORE INTO fact_relations
+                   (fact_id_a, fact_id_b, relation, strength)
+                   VALUES (?, ?, ?, ?)""",
+                (id_a, id_b, relation, round(sim, 4)),
+            )
 
     conn.commit()
     conn.close()
@@ -344,16 +523,38 @@ def retrieve_facts(
     # ── 5. Apply threshold and bump retrieval_count ───────────────────────
     # Note: rrf scores are small (<0.04), so the historical 0.25 threshold
     # mostly rejects via recency/freq contributions. Kept for compatibility.
+    primary_ids: list[int] = []
     results: list[str] = []
+    content_by_id: dict[int, str] = {fid: content for _s, fid, content in scored}
     for score, fid, content in scored[:top_n]:
         if score >= threshold:
             results.append(content)
+            primary_ids.append(fid)
             conn.execute(
                 "UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE id = ?",
                 (fid,),
             )
+
+    # ── 6. Graph expansion: append connected neighbours not already returned ─
+    # Commit and close BEFORE graph expansion — get_related_facts() opens its own
+    # connection and calls init_db() (DDL). Running DDL while this connection holds
+    # a write lock causes SQLITE_BUSY ("database is locked").
     conn.commit()
     conn.close()
+
+    seen_content: set[str] = set(results)
+    extra_cap = top_n + 3  # hard cap to prevent context explosion
+    for fid in primary_ids:
+        if len(results) >= extra_cap:
+            break
+        for neighbour in get_related_facts(fid, depth=1):
+            if len(results) >= extra_cap:
+                break
+            nc = neighbour["content"]
+            if nc not in seen_content:
+                seen_content.add(nc)
+                results.append(nc)
+
     return results
 
 
@@ -487,6 +688,24 @@ if __name__ == "__main__":
 
     elif cmd == "session_unmark":
         session_unmark(sys.argv[2])
+
+    elif cmd == "link_facts":
+        fact_id_a = int(sys.argv[2])
+        fact_id_b = int(sys.argv[3])
+        relation  = sys.argv[4] if len(sys.argv) > 4 else "related"
+        strength  = float(sys.argv[5]) if len(sys.argv) > 5 else 0.7
+        link_facts(fact_id_a, fact_id_b, relation, strength)
+
+    elif cmd == "get_related":
+        fact_id = int(sys.argv[2])
+        depth   = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+        print(json.dumps(get_related_facts(fact_id, depth)))
+
+    elif cmd == "get_graph":
+        project_id = sys.argv[2]
+        query      = sys.argv[3]
+        depth      = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+        print(json.dumps(get_graph(project_id, query, depth)))
 
     else:
         print(json.dumps({"error": f"Unknown command: {cmd}"}), file=sys.stderr)
