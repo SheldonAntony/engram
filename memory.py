@@ -110,6 +110,11 @@ _SESSION_MAX_LOOKBACK  = 7      # sessions back before score → 0.0
 _ENRICHMENT_MAX_TOKENS = 500    # max combined tokens before enrichment falls back to insert
 _ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact before enriching
 
+# Step 7: Retrospective ENRICH (consolidate_memories) tuning constants.
+_RETRO_FLOOR  = 0.35   # minimum pairwise cosine to trigger a merge
+_RETRO_GUARD  = 0.30   # merged embedding must be >= this to BOTH originals (prevents chaining)
+_RETRO_MAX    = 500    # default merge cap per consolidate_memories() call
+
 
 # ── Embedding cache for ANN-based Pool A ─────────────────────────────────────
 # Keyed by project_id → (fid_list, emb_matrix) where emb_matrix is shape (N, D).
@@ -1335,34 +1340,186 @@ def retrieve_facts(
     return results
 
 
-def consolidate_memories(project_id: str, session_id: str) -> dict:
-    """Return the last 50 live facts for LLM-assisted consolidation (Phase 6).
+def consolidate_memories(
+    project_id: str,
+    session_id: str,
+    max_merges: int = _RETRO_MAX,
+) -> dict:
+    """Retrospective ENRICH: merge live facts with pairwise cosine >= _RETRO_FLOOR.
 
-    The caller (LLM) reviews the list for contradictions and redundancies,
-    then calls store_memory to update stale entries.
+    Scans all live fact embeddings for the project, finds similar pairs, and
+    merges the lower-priority fact into the higher-retrieval-count one using the
+    same ENRICH mutation that store_fact() uses.
+
+    Pairwise safeguard (_RETRO_GUARD): after merging, the merged embedding must
+    be >= _RETRO_GUARD similar to BOTH originals — prevents chaining facts that
+    are only transitively similar.
+
+    Token cap: merged text must not exceed _ENRICHMENT_MAX_TOKENS words.
+    Cache: _CACHE_DIRTY is set so the next retrieve_facts() reloads embeddings.
+
+    Returns:
+        {"project_id", "merged", "pairs_checked", "max_merges"}
     """
-    conn = init_db()
-    cursor = conn.execute(
-        """SELECT id, content, fact_type, created_at, retrieval_count
-           FROM facts
-           WHERE project_id = ?
-             AND superseded_at IS NULL
-             AND (valid_to IS NULL OR valid_to > unixepoch())
-           ORDER BY id DESC LIMIT 50""",
-        (project_id,),
-    )
-    facts = [
-        {
-            "id": r[0],
-            "content": r[1],
-            "fact_type": r[2],
-            "created_at": r[3],
-            "retrieval_count": r[4],
+    if not _NUMPY_AVAILABLE:
+        return {
+            "project_id": project_id, "merged": 0,
+            "pairs_checked": 0, "max_merges": max_merges,
+            "error": "numpy not available",
         }
-        for r in cursor.fetchall()
-    ]
+
+    conn = init_db()
+    _COLS = (
+        "id, content, embedding, entities, retrieval_count, fact_type, session_id"
+    )
+    _WHERE = (
+        "project_id = ? AND superseded_at IS NULL "
+        "AND (valid_to IS NULL OR valid_to > unixepoch())"
+    )
+    rows = conn.execute(
+        f"SELECT {_COLS} FROM facts WHERE {_WHERE} ORDER BY id ASC",
+        (project_id,),
+    ).fetchall()
+
+    if len(rows) < 2:
+        conn.close()
+        return {"project_id": project_id, "merged": 0, "pairs_checked": 0, "max_merges": max_merges}
+
+    # Decode embeddings; skip facts that have none.
+    fids: list[int] = []
+    contents: list[str] = []
+    vecs: list = []
+    ents_jsons: list[str] = []
+    rcs: list[int] = []
+
+    for fid, content, emb_blob, ents_json, rc, _ft, _sid in rows:
+        vec = _decode_embedding(emb_blob)
+        if vec is None:
+            continue
+        fids.append(fid)
+        contents.append(content)
+        vecs.append(vec)
+        ents_jsons.append(ents_json or "[]")
+        rcs.append(rc or 0)
+
+    n = len(fids)
+    if n < 2:
+        conn.close()
+        return {"project_id": project_id, "merged": 0, "pairs_checked": 0, "max_merges": max_merges}
+
+    mat = np.array(vecs, dtype=np.float32)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    mat = mat / norms  # normalised rows: dot product == cosine
+
+    sim_mat = mat @ mat.T  # shape (n, n), full pairwise cosine
+
+    superseded: set[int] = set()   # indices already merged away this run
+    merged_count = 0
+    pairs_checked = 0
+
+    for i in range(n):
+        if merged_count >= max_merges:
+            break
+        if i in superseded:
+            continue
+        for j in range(i + 1, n):
+            if merged_count >= max_merges:
+                break
+            if j in superseded:
+                continue
+
+            sim = float(sim_mat[i, j])
+            pairs_checked += 1
+            if sim < _RETRO_FLOOR:
+                continue
+
+            combined = contents[i] + "\n" + contents[j]
+            if len(combined.split()) > _ENRICHMENT_MAX_TOKENS:
+                continue
+
+            # Keep the fact with more retrievals; on tie keep the older (lower id).
+            if rcs[i] >= rcs[j]:
+                base_idx, inc_idx = i, j
+            else:
+                base_idx, inc_idx = j, i
+
+            merged_text = contents[base_idx] + "\n" + contents[inc_idx]
+
+            # Pairwise safeguard: merged embedding must be close to BOTH originals.
+            merged_emb_raw = embed_text(merged_text)
+            merged_vec = np.array(merged_emb_raw, dtype=np.float32)
+            mvnorm = np.linalg.norm(merged_vec)
+            if mvnorm > 0:
+                merged_vec = merged_vec / mvnorm
+            if (float(merged_vec @ mat[base_idx]) < _RETRO_GUARD or
+                    float(merged_vec @ mat[inc_idx]) < _RETRO_GUARD):
+                continue  # merged content would drift too far from one parent
+
+            base_fid = fids[base_idx]
+            inc_fid  = fids[inc_idx]
+            old_base_content = contents[base_idx]
+
+            try:
+                merged_ents = list(
+                    set(json.loads(ents_jsons[base_idx]))
+                    | set(json.loads(ents_jsons[inc_idx]))
+                )
+            except Exception:
+                merged_ents = []
+
+            merged_blob = _encode_embedding(merged_emb_raw)
+
+            # FTS5 external-content: delete old entry then re-insert.
+            conn.execute(
+                "INSERT INTO facts_fts(facts_fts, rowid, content) VALUES('delete', ?, ?)",
+                (base_fid, old_base_content),
+            )
+            conn.execute(
+                """UPDATE facts
+                   SET content = ?, embedding = ?, entities = ?, last_retrieved_at = ?
+                   WHERE id = ?""",
+                (merged_text, merged_blob, json.dumps(merged_ents), time.time(), base_fid),
+            )
+            conn.execute(
+                "INSERT INTO facts_fts(rowid, content) VALUES (?, ?)",
+                (base_fid, merged_text),
+            )
+            conn.execute(
+                """INSERT INTO fact_mutations
+                   (fact_id, mutation_type, old_content, new_content, session_id)
+                   VALUES (?, 'ENRICH', ?, ?, ?)""",
+                (base_fid, old_base_content, merged_text, session_id),
+            )
+            # Supersede the incoming fact (soft-delete).
+            conn.execute(
+                "UPDATE facts SET superseded_at = unixepoch() WHERE id = ?", (inc_fid,)
+            )
+            conn.execute(
+                """INSERT INTO fact_mutations
+                   (fact_id, mutation_type, old_content, session_id)
+                   VALUES (?, 'RELEASE', ?, ?)""",
+                (inc_fid, contents[inc_idx], session_id),
+            )
+
+            # Update in-memory state so later pairs see the merged content/vector.
+            contents[base_idx] = merged_text
+            mat[base_idx] = merged_vec
+            sim_mat[base_idx, :] = mat @ merged_vec
+            sim_mat[:, base_idx] = sim_mat[base_idx, :]
+            superseded.add(inc_idx)
+            merged_count += 1
+
+    if merged_count > 0:
+        conn.commit()
+        _CACHE_DIRTY.add(project_id)
     conn.close()
-    return {"project_id": project_id, "facts": facts, "count": len(facts)}
+    return {
+        "project_id": project_id,
+        "merged": merged_count,
+        "pairs_checked": pairs_checked,
+        "max_merges": max_merges,
+    }
 
 
 def memory_release(fact_id: int, session_id: str = "") -> dict:
