@@ -766,6 +766,7 @@ def retrieve_facts(
     threshold: float = 0.25,
     include_budget_info: bool = False,
     max_tokens: int = 2000,
+    _gold_fid: "int | None" = None,
 ) -> "list[str] | dict":
     """Hybrid BM25 + vector + entity-overlap retrieval via three-way RRF.
 
@@ -807,6 +808,13 @@ def retrieve_facts(
     ).fetchall()
     pool_b = [r for r in pool_b_raw if r[0] not in pool_a_ids][:_POOL_B_LIMIT]
     all_candidate_rows = pool_a + pool_b
+
+    # Diagnostic stage tracking (only active when _gold_fid is provided).
+    _stages: dict = {}
+    if _gold_fid is not None:
+        _pool_fids = [r[0] for r in all_candidate_rows]
+        _stages["pool_pos"] = _pool_fids.index(_gold_fid) if _gold_fid in _pool_fids else -1
+        _stages["pool_size"] = len(_pool_fids)
 
     rows: list = []
     for fid, content, emb_data, rc, ca, ft, ef, lra, ivd, ents, imp, fsid in all_candidate_rows:
@@ -948,6 +956,12 @@ def retrieve_facts(
         scored_all.append((score, fid, content, ef, lra, rc))
     scored_all.sort(reverse=True, key=lambda x: x[0])
 
+    # Stage 1: post-scoring position.
+    if _gold_fid is not None:
+        _sa_fids = [r[1] for r in scored_all]
+        _stages["scored_pos"] = _sa_fids.index(_gold_fid) if _gold_fid in _sa_fids else -1
+        _stages["scored_size"] = len(_sa_fids)
+
     # ── 7. SM-2 gate — soft relax when < 3 facts pass (Phase 2) ──────────
     _lra_by_fid = {r[0]: r[7] for r in rows}
     _ivd_by_fid = {r[0]: r[8] for r in rows}
@@ -968,6 +982,12 @@ def retrieve_facts(
     due_scored = [row for row in scored_all if _is_due(row[1])]
     scored = due_scored if len(due_scored) >= 3 else scored_all
     total_candidates = len(scored)
+
+    # Stage 2: post-gate position.
+    if _gold_fid is not None:
+        _g_fids = [r[1] for r in scored]
+        _stages["gated_pos"] = _g_fids.index(_gold_fid) if _gold_fid in _g_fids else -1
+        _stages["gated_size"] = len(_g_fids)
 
     # Phase C: MMR diversity — greedy select up to 20 diverse candidates for cross-encoder.
     if len(scored) > 5:
@@ -995,6 +1015,13 @@ def retrieve_facts(
             remaining.remove(best_row)
         scored = mmr_selected + remaining
 
+    # Stage 3: post-MMR position (in top-20 or pushed to remaining).
+    if _gold_fid is not None:
+        _mmr_fids = [r[1] for r in scored]
+        _gold_mmr_pos = _mmr_fids.index(_gold_fid) if _gold_fid in _mmr_fids else -1
+        _stages["mmr_pos"] = _gold_mmr_pos
+        _stages["in_mmr_top20"] = 0 <= _gold_mmr_pos < 20
+
     # ── 8. Cross-encoder reranking (Phase 4) ──────────────────────────────
     # Reranks top-20 when sentence-transformers is loaded; 500ms latency cap.
     quality_by_fid: dict[int, float] = {}
@@ -1019,6 +1046,11 @@ def retrieve_facts(
                 scored = reranked_top20 + scored[20:]
     except Exception:
         pass
+
+    # Stage 4: post-cross-encoder position.
+    if _gold_fid is not None:
+        _ce_fids = [r[1] for r in scored]
+        _stages["ce_pos"] = _ce_fids.index(_gold_fid) if _gold_fid in _ce_fids else -1
 
     # ── 9. Apply threshold, token budget, SM-2 EF update ─────────────────
     ft_by_fid = {r[0]: r[5] for r in rows}
@@ -1076,12 +1108,17 @@ def retrieve_facts(
                 results.append(nc)
 
     if include_budget_info:
-        return {
+        ret = {
             "facts": results,
             "budget_hit": budget_hit,
             "retrieved_count": len(results),
             "total_candidates": total_candidates,
         }
+        if _gold_fid is not None:
+            _gold_ids = [fid for fid in primary_ids]
+            _stages["final_pos"] = _gold_ids.index(_gold_fid) if _gold_fid in _gold_ids else -1
+            ret["_stages"] = _stages
+        return ret
     return results
 
 
