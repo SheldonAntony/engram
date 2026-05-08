@@ -103,7 +103,7 @@ _WINDOW_DEMOTION = 0.55
 _SM2_GATE_ENABLED = False
 
 # ── Tunable retrieval constants ───────────────────────────────────────────────
-_POOL_A_LIMIT          = 500    # most-recent facts (recency pool) — raised from 200
+_POOL_A_LIMIT          = 750    # most-recent facts (recency pool) — raised from 200
 _POOL_B_LIMIT          = 300    # proven-useful facts (retrieval_count > 0)
 _TEMPORAL_EDGE_DECAY   = 0.25   # strength decay per turn distance (linear)
 _TEMPORAL_MAX_DISTANCE = 3      # turns back to link temporally
@@ -1262,10 +1262,22 @@ def retrieve_facts(
         cross_enc = _get_cross_encoder()
         if cross_enc is not None and len(scored) > 5:
             top20 = scored[:40]
+            # BM25 anchor: guarantee top-5 BM25 facts enter the CE pool even if
+            # composite scoring pushed them past position 40.
+            if bm25_rank:
+                top20_fids = {r[1] for r in top20}
+                bm25_anchors = [
+                    row for row in scored[40:]
+                    if row[1] in bm25_rank and bm25_rank[row[1]] < 5
+                    and row[1] not in top20_fids
+                ]
+                if bm25_anchors:
+                    top20 = top20 + bm25_anchors
+            ce_pool_fids = {r[1] for r in top20}
             pairs = [(prompt, c) for _, _, c, *_ in top20]
             t0 = time.time()
             ce_raw = cross_enc.predict(pairs)
-            if time.time() - t0 < 1.0:
+            if time.time() - t0 < 3.0:
                 ce_min = min(ce_raw)
                 ce_max = max(ce_raw)
                 ce_range = ce_max - ce_min if ce_max > ce_min else 1.0
@@ -1276,7 +1288,8 @@ def retrieve_facts(
                      for _, fid, c, ef, lra, rc in top20],
                     reverse=True,
                 )
-                scored = reranked_top20 + scored[20:]
+                scored_tail = [r for r in scored if r[1] not in ce_pool_fids]
+                scored = reranked_top20 + scored_tail
     except Exception:
         pass
 
