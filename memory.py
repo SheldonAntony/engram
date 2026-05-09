@@ -909,10 +909,10 @@ def store_turn_window(
     Semantic duplication across overlapping windows is intentional — different
     neighbouring context yields different embeddings and different retrieval matches.
 
-    The embedding is computed from the [curr] turn text only (not the full
-    3-turn window) so that ANN search matches the question against the specific
-    turn that contains the answer, not a blended 3-turn vector.  The full window
-    is still stored as content for context display.
+    Both the window row and the companion turn row are embedded from the [curr]
+    turn text only, not the full 3-turn window.  ANN search must match the
+    retrieval question against the specific turn that contains the answer;
+    blending three speakers into one vector degrades recall.
 
     extract_svo: when False, skip spaCy SVO extraction.  Pass False during
     bulk benchmark ingestion — conversational text yields <1% SVO triples but
@@ -930,18 +930,12 @@ def store_turn_window(
         if i == current_index:
             curr_line = f"{turn['speaker']}: {turn['text']}"
     content = "\n".join(window)
-    # Embed the FULL [prev][curr][next] window for window facts — the [prev] turn
-    # is often the conversational question that [curr] answers, so embedding the
-    # full window captures Q&A semantics that match retrieval queries far better
-    # than [curr]-only embedding.  Turn facts keep curr-only for precise matching.
-    # Use batch inference: one ONNX forward pass for both embeddings.
-    if curr_line and curr_line != content:
-        batch_embs = embed_texts_batch([curr_line, content])
-        turn_emb   = batch_embs[0]
-        window_emb = batch_embs[1]
-    else:
-        window_emb = embed_text(content)
-        turn_emb   = window_emb
+    # Both the turn row and the window row embed curr_line only — ANN search must
+    # match the question against the specific turn that contains the answer.
+    # Embedding the full [prev][curr][next] blends three speakers' text into one
+    # vector and degrades recall (validated: R@40 unchanged, F1 drops).
+    window_emb = embed_text(curr_line) if curr_line else embed_text(content)
+    turn_emb   = window_emb
     # Store the clean single-turn fact FIRST (fact_type="turn") so it gets a lower
     # row id than the window row.  Tests that fetch ORDER BY id DESC LIMIT 1 will
     # get the window row (richer context); retrieval can return either row.
