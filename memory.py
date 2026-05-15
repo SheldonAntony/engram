@@ -105,9 +105,15 @@ _WINDOW_DEMOTION = 0.55
 
 # SM-2 gate: when False, SM-2 interval check is skipped for candidate selection.
 # EF/interval updates still happen on retrieval — they feed the staleness score.
-# Gate is OFF because LoCoMo gold facts (and most unseen production facts) have
-# retrieval_count=0 and would be gated out before scoring even starts.
-_SM2_GATE_ENABLED = False
+# SM-2 spaced-repetition gate for deliberate, passive forgetting.
+# Gate is ON: facts that haven't been retrieved recently accumulate decay and are
+# demoted in ranking over time — the system forgets stale information automatically.
+# This is preferable to asking the user "is this outdated?" which is only reliable
+# when model staleness confidence is high (it usually isn't).
+#
+# NOTE: Disable (set False) when running LoCoMo benchmarks — gold facts start with
+# retrieval_count=0 and the gate would exclude them from scoring from the start.
+_SM2_GATE_ENABLED = True
 
 # ── Tunable retrieval constants ───────────────────────────────────────────────
 # PREFLIGHT_POOL_A overrides at runtime — useful for ablations without code changes.
@@ -848,6 +854,11 @@ def store_fact(project_id: str, session_id: str, text: str,
             "SELECT content FROM facts WHERE id = ?", (best_id,)
         ).fetchone()
         old_content = old_content_row[0] if old_content_row else ""
+        print(
+            f"[engram] Replaced contradicting fact (sim={best_sim:.2f}): "
+            f'"{old_content[:60]}" \u2192 "{text[:60]}"',
+            file=sys.stderr, flush=True,
+        )
         conn.execute(
             """INSERT INTO fact_mutations (fact_id, mutation_type, old_content, new_content, session_id)
                VALUES (?, 'SUPERSEDE', ?, ?, ?)""",
