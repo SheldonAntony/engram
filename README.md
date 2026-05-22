@@ -1,8 +1,10 @@
 # engram
 
-Persistent semantic memory for AI coding agents.
+**MCP server** for persistent semantic memory in AI agents.
 
-**~78% R@3 on LoCoMo** — no training data, no cloud APIs, no GPU required.
+engram is an [MCP](https://modelcontextprotocol.io) server that gives any AI agent long-term memory — facts, decisions, preferences, and conversation context persist across sessions. Works with Claude Desktop, Cursor, Windsurf, opencode, and any MCP-compatible client.
+
+**~78% R@3 on LoCoMo** — all signals are algorithmic. No training data, no cloud APIs, no GPU required.
 
 ---
 
@@ -132,8 +134,11 @@ Edit `preflight.config.json`:
 
 | Platform | Status |
 |----------|--------|
-| [opencode](https://opencode.ai) | Supported |
-| MCP (Claude Code, etc.) | Coming soon |
+| [MCP](https://modelcontextprotocol.io) (any client) | Supported |
+| [Claude Desktop](https://claude.ai) | Supported via MCP |
+| [Cursor](https://cursor.sh) | Supported via MCP |
+| [Windsurf](https://codeium.com/windsurf) | Supported via MCP |
+| [opencode](https://opencode.ai) | Supported (native plugin) |
 
 ---
 
