@@ -25,7 +25,7 @@ All data stays on your machine. Nothing is sent to any cloud.
 | Runs fully local | ✅ | ❌ (cloud API) | ❌ | ⚠️ (varies) |
 | No GPU required | ✅ | N/A (cloud) | N/A | ✅ |
 | No training data | ✅ | ❌ | ❌ | ✅ |
-| No paid API keys | ✅ | ❌ ($0.50/token) | ❌ | ⚠️ (varies) |
+| No paid API keys | ✅ | ❌ (paid API) | ❌ | ⚠️ (varies) |
 | Multi-signal retrieval | ✅ | ❌ (cosine only) | ❌ | ❌ (cosine only) |
 | Cross-encoder reranker | ✅ | ❌ | ❌ | ❌ |
 | Works with any MCP client | ✅ | ❌ | ❌ | ❌ |
@@ -33,7 +33,7 @@ All data stays on your machine. Nothing is sent to any cloud.
 
 Most memory systems use **cosine similarity only** — they embed everything, compute distance, and call it done. That misses ~35% of relevant facts for real-world queries.
 
-engram uses **8 signals** fused together (cosine + BM25 + WordNet + person names + dates + bigrams + conversation context + cross-encoder reranking), hitting ~78% recall@3 — **without training on any dataset**.
+engram uses **8 signals** fused together (cosine + BM25 + WordNet + person names + dates + bigrams + conversation context + cross-encoder reranking), hitting ~77% recall@3 — **without training on any dataset**.
 
 ---
 
@@ -160,10 +160,10 @@ Evaluated on **LoCoMo** — 1,531 real questions across 10 long conversations:
 |--------|----------|---------------|
 | Cosine only | 65.90% | 34/100 questions miss the fact |
 | + keywords + names + dates | 71.35% | 29/100 miss |
-| **+ cross-encoder** | **77.86%** | **22/100 miss — best without training** |
+| **+ cross-encoder** | **76.87%** | **23/100 miss — best without training** |
 | Competitor (trained on benchmark) | 80.99% | 19/100 miss — but requires offline training |
 
-engram closes **77% of the gap** to the trained competitor, with **zero training data**.
+engram closes **~75% of the gap** to the trained competitor, with **zero training data**.
 
 ---
 
@@ -188,7 +188,7 @@ engram closes **77% of the gap** to the trained competitor, with **zero training
 
 2. **No training debt.** Unlike competitors that need to train on your data before they work well, engram's signals are engineered — they work at full quality from the first query.
 
-3. **No GPU, no problem.** The cross-encoder runs on CPU (~1 second for 120 candidate pairs). Works on a Raspberry Pi.
+3. **No GPU, no problem.** The cross-encoder runs on CPU (~1 second for 120 candidate pairs).
 
 4. **Less token waste.** engram's retrieval is tuned to return the minimum facts needed — the multi-signal pipeline finds the right facts faster, so fewer irrelevant tokens pollute the agent's context window.
 

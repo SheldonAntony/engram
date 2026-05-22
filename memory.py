@@ -1744,12 +1744,13 @@ def retrieve_facts(
     _ef_by_fid  = {r[0]: float(r[6]) for r in rows}
     _sta_by_fid = {r[0]: min((now_ts - r[7]) / (30 * 86400), 1.0)
                    if r[7] is not None else 1.0 for r in rows}
+    _rc_by_fid  = {r[0]: r[3] for r in rows}
 
     if _SM2_GATE_ENABLED:
         def _is_due(fid: int) -> bool:
             lra = _lra_by_fid.get(fid)
             ivd = _ivd_by_fid.get(fid, 1.0)
-            if lra is None:
+            if _rc_by_fid.get(fid, 0) == 0 or lra is None:
                 return True
             if _ef_by_fid.get(fid, 2.5) <= 1.5 and _sta_by_fid.get(fid, 1.0) > 0.5:
                 return True

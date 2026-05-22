@@ -16,16 +16,23 @@ try:
     init_db()
 except Exception:
     pass  # schema already exists, migration warnings are harmless
+import time
+
+
+def _sid(project_id: str, session_id: str = "") -> str:
+    return session_id or f"mcp-{project_id}-{int(time.time())}"
+
+
 mcp = FastMCP("engram", instructions="Long-term memory for AI agents. Stores and retrieves facts, decisions, preferences, and conversation context.")
 
 
 @mcp.tool()
-def search(project_id: str, query: str, top_n: int = 3) -> str:
+def search(project_id: str, query: str, top_n: int = 3, session_id: str = "") -> str:
     """Search memory for facts matching the query.
     
     Returns ranked facts with content, type, and relevance scores.
     """
-    result = retrieve_facts(project_id, "", query, top_n=top_n, threshold=0.0, include_budget_info=True)
+    result = retrieve_facts(project_id, _sid(project_id, session_id), query, top_n=top_n, threshold=0.0, include_budget_info=True)
     facts = result if isinstance(result, list) else result.get("facts", [])
     if not facts:
         return "No matching facts found."
@@ -36,12 +43,12 @@ def search(project_id: str, query: str, top_n: int = 3) -> str:
 
 
 @mcp.tool()
-def remember(project_id: str, session_id: str, content: str, fact_type: str = "note") -> str:
+def remember(project_id: str, content: str, fact_type: str = "note", session_id: str = "") -> str:
     """Store a fact in memory.
     
     fact_type: note | decision | preference | finding | snippet | summary
     """
-    fid = store_fact(project_id, session_id, content, fact_type)
+    fid = store_fact(project_id, _sid(project_id, session_id), content, fact_type)
     return f"Stored as fact #{fid}"
 
 
