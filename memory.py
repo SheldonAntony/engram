@@ -101,7 +101,8 @@ _MMR_LAMBDA_POST_CE = 0.25 # post-CE output: light diversity deduplication
 
 # Step 6: window demotion factor — applied to composite score for fact_type="window".
 # Keeps windows retrievable as fallback while atomic SVO facts rank above them.
-_WINDOW_DEMOTION = 0.55
+# Set to 1.0 to disable demotion entirely (recommended: window facts carry useful context).
+_WINDOW_DEMOTION = float(os.environ.get("PREFLIGHT_WINDOW_DEMOTION", "1.0"))
 
 # SM-2 gate: when False, SM-2 interval check is skipped for candidate selection.
 # EF/interval updates still happen on retrieval — they feed the staleness score.
@@ -116,15 +117,30 @@ _WINDOW_DEMOTION = 0.55
 _SM2_GATE_ENABLED = True
 
 # ── Tunable retrieval constants ───────────────────────────────────────────────
-# PREFLIGHT_POOL_A overrides at runtime — useful for ablations without code changes.
-_POOL_A_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_A", "750"))   # most-recent facts pool
-_POOL_B_LIMIT          = 300    # proven-useful facts (retrieval_count > 0)
+# All can be overridden via env vars for deployment tuning.
+_POOL_A_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_A", "750"))   # ANN pool size
+_POOL_B_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_B", "300"))   # proven-useful pool
+_RRF_K                 = int(os.environ.get("PREFLIGHT_RRF_K", "15"))     # RRF smoothing (15=tight, 60=loose)
+_BROAD_POOL            = int(os.environ.get("PREFLIGHT_BROAD_POOL", "200")) # union top-N from each signal
+_USE_DERIVED_BM25      = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
+_USE_LEXICAL_CHANNELS  = os.environ.get("PREFLIGHT_USE_LEXICAL_CHANNELS", "0") == "1"
+_USE_CONTEXT_BM25      = os.environ.get("PREFLIGHT_USE_CONTEXT_BM25", "0") == "1"
+_CONTEXT_WINDOW_SIZE   = int(os.environ.get("PREFLIGHT_CONTEXT_WINDOW", "3"))
+_CE_POOL_SIZE          = int(os.environ.get("PREFLIGHT_CE_POOL", "120"))   # candidates fed to CE (benchmark: 200)
+_CE_TIMEOUT            = float(os.environ.get("PREFLIGHT_CE_TIMEOUT", "5.0")) # max seconds for CE (bigger model needs more)
+_CE_GUARD_K            = int(os.environ.get("PREFLIGHT_CE_GUARD_K", "40")) # min-rank guard after CE (0=disabled)
+_COVERAGE_K            = int(os.environ.get("PREFLIGHT_COVERAGE_K", "40")) # min-rank after scoring (0=disabled)
 _TEMPORAL_EDGE_DECAY   = 0.25   # strength decay per turn distance (linear)
 _TEMPORAL_MAX_DISTANCE = 3      # turns back to link temporally
 _SESSION_RECENCY_DECAY = 0.15   # score decay per session gap
 _SESSION_MAX_LOOKBACK  = 7      # sessions back before score → 0.0
 _ENRICHMENT_MAX_TOKENS = 500    # max combined tokens before enrichment falls back to insert
 _ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact before enriching
+
+# Benchmark mode: used by recall_ablation.py to test production retrieval against LoCoMo.
+# When enabled, retrieve_facts() skips pool caps, composite scoring, SM-2 updates,
+# MMR, graph expansion, and returns (facts_list, fids_list) instead of just facts_list.
+_RETRIEVE_BENCHMARK = os.environ.get("PREFLIGHT_RETRIEVE_BENCHMARK", "0") == "1"
 
 # Step 7: Retrospective ENRICH (consolidate_memories) tuning constants.
 _RETRO_FLOOR  = 0.35   # minimum pairwise cosine to trigger a merge
@@ -1282,7 +1298,7 @@ def retrieve_facts(
             if qnorm > 0:
                 qvec = qvec / qnorm
             sims = cached_mat @ qvec          # shape (N,), cosine similarity
-            top_k = min(_POOL_A_LIMIT, len(cached_fids))
+            top_k = len(cached_fids) if _RETRIEVE_BENCHMARK else min(_POOL_A_LIMIT, len(cached_fids))
             top_indices = np.argpartition(sims, -top_k)[-top_k:]
             top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
             top_fids = [cached_fids[i] for i in top_indices]
@@ -1306,13 +1322,16 @@ def retrieve_facts(
         ).fetchall()
 
     pool_a_ids = {r[0] for r in pool_a}
-    pool_b_raw = conn.execute(
-        f"SELECT {_COLS} FROM facts WHERE {_WHERE} AND retrieval_count > 0 "
-        f"ORDER BY retrieval_count DESC, last_retrieved_at DESC LIMIT ?",
-        (project_id, _POOL_A_LIMIT + _POOL_B_LIMIT),
-    ).fetchall()
-    pool_b = [r for r in pool_b_raw if r[0] not in pool_a_ids][:_POOL_B_LIMIT]
-    all_candidate_rows = pool_a + pool_b
+    if not _RETRIEVE_BENCHMARK:
+        pool_b_raw = conn.execute(
+            f"SELECT {_COLS} FROM facts WHERE {_WHERE} AND retrieval_count > 0 "
+            f"ORDER BY retrieval_count DESC, last_retrieved_at DESC LIMIT ?",
+            (project_id, _POOL_A_LIMIT + _POOL_B_LIMIT),
+        ).fetchall()
+        pool_b = [r for r in pool_b_raw if r[0] not in pool_a_ids][:_POOL_B_LIMIT]
+        all_candidate_rows = pool_a + pool_b
+    else:
+        all_candidate_rows = pool_a
 
     # Diagnostic stage tracking (only active when _gold_fid is provided).
     _stages: dict = {}
@@ -1357,17 +1376,20 @@ def retrieve_facts(
     max_rc = max_rc_row[0] if max_rc_row and max_rc_row[0] else 1
 
     # Phase B: augment vector query with slot fills (BM25 uses bare prompt).
-    try:
-        slot_rows = conn.execute(
-            "SELECT slot_name, value FROM slot_fills WHERE project_id = ? LIMIT 5",
-            (project_id,),
-        ).fetchall()
-        augmented_prompt = (
-            " ".join(f"{k}={str(v)[:50]}" for k, v in slot_rows) + ": " + prompt
-            if slot_rows else prompt
-        )
-    except Exception:
+    if _RETRIEVE_BENCHMARK:
         augmented_prompt = prompt
+    else:
+        try:
+            slot_rows = conn.execute(
+                "SELECT slot_name, value FROM slot_fills WHERE project_id = ? LIMIT 5",
+                (project_id,),
+            ).fetchall()
+            augmented_prompt = (
+                " ".join(f"{k}={str(v)[:50]}" for k, v in slot_rows) + ": " + prompt
+                if slot_rows else prompt
+            )
+        except Exception:
+            augmented_prompt = prompt
 
     # ── 2. Vector ranking ──────────────────────────────────────────────────
     prompt_emb = embed_text(augmented_prompt)
@@ -1377,13 +1399,14 @@ def retrieve_facts(
         reverse=True,
     )
     vec_rank: dict[int, int] = {fid: rank for rank, (_, fid) in enumerate(vec_scored)}
+    content_by_fid: dict[int, str] = {fid: content for fid, content, *_ in rows}
 
     # ── 3. BM25 via FTS5 ──────────────────────────────────────────────────
     bm25_rank: dict[int, int] = {}
     phrase_fids: set[int] = set()   # facts matching exact phrase — get 1.5× BM25 boost
     fts_query = _fts5_query(prompt)
+    candidate_ids = tuple(fid for fid, *_ in rows)
     if fts_query:
-        candidate_ids = tuple(fid for fid, *_ in rows)
         placeholders = ",".join("?" for _ in candidate_ids)
         try:
             bm_cursor = conn.execute(
@@ -1414,34 +1437,191 @@ def retrieve_facts(
             except sqlite3.OperationalError:
                 pass
 
-    # ── 4. Entity-overlap ranking (Phase 3) ───────────────────────────────
-    entity_rank: dict[int, int] = {}
-    try:
-        prompt_ents = set(e.lower() for e in _extract_entities(prompt))
-        if prompt_ents:
-            ent_scores = []
-            for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json, _imp, _fsid in rows:
-                try:
-                    fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
-                except Exception:
-                    fact_ents = set()
-                shared = prompt_ents & fact_ents
-                n_shared = len(shared)
-                ratio = n_shared / max(len(prompt_ents), len(fact_ents), 1)
-                # Require >=2 shared entities OR ratio >0.3 to prevent
-                # single generic-entity false matches (e.g. "Python", "the project").
-                if n_shared >= 2 or ratio > 0.3:
-                    overlap = ratio
-                else:
-                    overlap = 0.0
-                ent_scores.append((overlap, fid))
-            ent_scores.sort(reverse=True)
-            entity_rank = {fid: rank for rank, (_, fid) in enumerate(ent_scores)}
-    except Exception:
-        pass
+    # ── 4. Derived BM25 via WordNet expansion (optional) ──────────────────
+    derived_rank: dict[int, int] = {}
+    if _USE_DERIVED_BM25 and fts_query:
+        try:
+            derived_q = _build_derived_text(prompt)
+            safe_d = "".join(c if c.isalnum() or c.isspace() else " " for c in derived_q)
+            dtokens = [t for t in safe_d.split() if len(t) > 2]
+            if dtokens:
+                dfts_q = " OR ".join(f'"{t}"' for t in dtokens)
+                dr_rows = conn.execute(
+                    "SELECT rowid FROM facts_derived_fts"
+                    " WHERE facts_derived_fts MATCH ? ORDER BY bm25(facts_derived_fts)",
+                    (dfts_q,),
+                ).fetchall()
+                dr_rank = 0
+                fids_set_d = set(candidate_ids)
+                for (dfid,) in dr_rows:
+                    if dfid in fids_set_d:
+                        derived_rank[dfid] = dr_rank
+                        dr_rank += 1
+        except Exception:
+            pass
 
-    # ── 5. Three-way RRF fusion ────────────────────────────────────────────
-    _RRF_K = 60
+    # ── 5. Entity-overlap ranking ─────────────────────────────────────────
+    entity_rank: dict[int, int] = {}
+    if not _RETRIEVE_BENCHMARK:
+        try:
+            prompt_ents = set(e.lower() for e in _extract_entities(prompt))
+            if prompt_ents:
+                ent_scores = []
+                for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json, _imp, _fsid in rows:
+                    try:
+                        fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
+                    except Exception:
+                        fact_ents = set()
+                    shared = prompt_ents & fact_ents
+                    n_shared = len(shared)
+                    ratio = n_shared / max(len(prompt_ents), len(fact_ents), 1)
+                    if n_shared >= 2 or ratio > 0.3:
+                        overlap = ratio
+                    else:
+                        overlap = 0.0
+                    ent_scores.append((overlap, fid))
+                ent_scores.sort(reverse=True)
+                entity_rank = {fid: rank for rank, (_, fid) in enumerate(ent_scores)}
+        except Exception:
+            pass
+
+    # ── 6. Conversation-context BM25 ──────────────────────────────────────
+    # For each fact, compute how well the adjacent window (fact ± N turns)
+    # matches the query. This captures multi-turn context that single-fact
+    # BM25 misses (e.g. a fact saying "We chose React" only makes sense
+    # alongside the previous turn asking "What frontend?").
+    context_rank: dict[int, int] = {}
+    if _USE_CONTEXT_BM25:
+        try:
+            _q_ctx_tokens = [
+                t for t in re.sub(r'[^a-z\s]', ' ', prompt.lower()).split()
+                if len(t) > 2 and t not in _BM25_STOPWORDS
+            ]
+            if _q_ctx_tokens:
+                # Build full content map for neighbor lookup (pool facts + any extras)
+                _ctx_content: dict[int, str] = {r[0]: r[1] for r in all_candidate_rows}
+                # If not all neighbor facts are in pool, load missing ones from DB
+                _pool_min = min(r[0] for r in all_candidate_rows)
+                _pool_max = max(r[0] for r in all_candidate_rows)
+                _missing_fids = set()
+                for _fid, *_ in rows:
+                    for _off in range(-_CONTEXT_WINDOW_SIZE, _CONTEXT_WINDOW_SIZE + 1):
+                        _nfid = _fid + _off
+                        if _pool_min <= _nfid <= _pool_max and _nfid not in _ctx_content:
+                            _missing_fids.add(_nfid)
+                if _missing_fids:
+                    _ph = ",".join("?" for _ in _missing_fids)
+                    try:
+                        for _mfid, _mcontent in conn.execute(
+                            f"SELECT id, content FROM facts WHERE id IN ({_ph}) "
+                            "AND superseded_at IS NULL",
+                            list(_missing_fids),
+                        ).fetchall():
+                            _ctx_content[_mfid] = _mcontent
+                    except Exception:
+                        pass
+                _ctx_scores: dict[int, int] = {}
+                for _fid, _content, *_ in rows:
+                    _window_parts = [_content]
+                    for _off in range(-_CONTEXT_WINDOW_SIZE, _CONTEXT_WINDOW_SIZE + 1):
+                        if _off == 0:
+                            continue
+                        _nc = _ctx_content.get(_fid + _off)
+                        if _nc:
+                            _window_parts.append(_nc)
+                    _window_text = " ".join(_window_parts).lower()
+                    _ctx_score = sum(
+                        1 for _t in _q_ctx_tokens if _t in _window_text
+                    )
+                    if _ctx_score:
+                        _ctx_scores[_fid] = _ctx_score
+                if _ctx_scores:
+                    _ctx_ranked = sorted(_ctx_scores, key=_ctx_scores.__getitem__, reverse=True)
+                    context_rank = {fid: i for i, fid in enumerate(_ctx_ranked)}
+        except Exception:
+            pass
+
+    # ── 7. Multi-signal broad pool (Phase 1) ──────────────────────────────
+    # Gather top-N from each signal into a union pool so facts strong in
+    # ANY one signal are visible to scoring. Tail (not in broad pool) is
+    # sorted by RRF and appended after.
+    n_facts = len(rows)
+    if _BROAD_POOL > 0:
+        _cos_order = sorted((fid for fid, *_ in rows), key=lambda f: vec_rank.get(f, n_facts))
+        _bm25_order = sorted((fid for fid, *_ in rows), key=lambda f: bm25_rank.get(f, n_facts))
+        _broad_parts: list[int] = _cos_order[:_BROAD_POOL] + _bm25_order[:_BROAD_POOL]
+        if _USE_DERIVED_BM25:
+            _broad_parts += sorted(
+                (fid for fid, *_ in rows), key=lambda f: derived_rank.get(f, n_facts)
+            )[:_BROAD_POOL]
+        if _USE_CONTEXT_BM25:
+            _broad_parts += sorted(
+                (fid for fid, *_ in rows), key=lambda f: context_rank.get(f, n_facts)
+            )[:_BROAD_POOL]
+        # Lexical explicit-memory channels (name/date/bigram)
+        if _USE_LEXICAL_CHANNELS:
+            import re as _re_lx
+            _STOPNAME_LX = frozenset({
+                'The', 'What', 'Who', 'When', 'Where', 'How', 'Does', 'Did',
+                'Was', 'Are', 'Can', 'Will', 'Is', 'Do', 'Has', 'Have', 'Had',
+                'Would', 'Could', 'Should', 'Which', 'Why', 'That', 'This',
+                'His', 'Her', 'Its', 'Our', 'Their', 'Then', 'Than', 'From',
+            })
+            # Channel A: person-name
+            _name_toks = [w for w in _re_lx.findall(r'\b[A-Z][a-z]{2,}\b', prompt)
+                          if w not in _STOPNAME_LX]
+            if _name_toks:
+                _name_sc: dict[int, int] = {}
+                for _fid, _c, *_ in rows:
+                    _s = sum(_c.count(_n) for _n in _name_toks)
+                    if _s:
+                        _name_sc[_fid] = _s
+                _broad_parts += sorted(_name_sc, key=_name_sc.__getitem__, reverse=True)[:_BROAD_POOL]
+            # Channel B: date/year
+            _MONTH_RE = r'(?:January|February|March|April|May|June|July|August|September|October|November|December)'
+            _date_toks = list(dict.fromkeys(
+                _re_lx.findall(rf'\b{_MONTH_RE}\s+\d{{4}}\b|\b\d{{4}}\b', prompt)
+            ))
+            if _date_toks:
+                _date_sc: dict[int, int] = {}
+                for _fid, _c, *_ in rows:
+                    _s = sum(_c.lower().count(_d.lower()) for _d in _date_toks)
+                    if _s:
+                        _date_sc[_fid] = _s
+                _broad_parts += sorted(_date_sc, key=_date_sc.__getitem__, reverse=True)[:_BROAD_POOL]
+            # Channel C: key-bigram
+            _q_words_lx = [w for w in _re_lx.sub(r'[^a-z\s]', ' ', prompt.lower()).split()
+                           if len(w) > 2 and w not in _BM25_STOPWORDS]
+            if len(_q_words_lx) >= 2:
+                _bigrams_lx = [f"{_q_words_lx[i]} {_q_words_lx[i+1]}"
+                               for i in range(len(_q_words_lx) - 1)]
+                _bgram_hits: list[int] = []
+                try:
+                    _phrase_q = " OR ".join(f'"{bg}"' for bg in _bigrams_lx)
+                    _br_rows = conn.execute(
+                        "SELECT rowid FROM facts_fts WHERE facts_fts MATCH ?",
+                        (_phrase_q,),
+                    ).fetchall()
+                    _fids_set_b = set(candidate_ids)
+                    for (_bfid,) in _br_rows:
+                        if _bfid in _fids_set_b:
+                            _bgram_hits.append(_bfid)
+                except Exception:
+                    _bgram_hits = []
+                if not _bgram_hits:
+                    for _fid, _c, *_ in rows:
+                        _cl = _c.lower()
+                        if any(_bg in _cl for _bg in _bigrams_lx):
+                            _bgram_hits.append(_fid)
+                _broad_parts += _bgram_hits[:_BROAD_POOL]
+        # Deduplicate while preserving partial order
+        _broad_cands = list(dict.fromkeys(_broad_parts))
+        _broad_set = set(_broad_cands)
+    else:
+        _broad_cands = [fid for fid, *_ in rows]
+        _broad_set = set(_broad_cands)
+
+    # ── 7. Three-way RRF fusion ────────────────────────────────────────────
     n = len(rows)
     raw_rrf: dict[int, float] = {}
     for fid, *_ in rows:
@@ -1451,53 +1631,89 @@ def retrieve_facts(
             if fid in phrase_fids:
                 bm25_component *= 1.5   # phrase match boost — exact phrase in content
             s += bm25_component
+        if _USE_DERIVED_BM25 and fid in derived_rank:
+            s += 1.0 / (_RRF_K + derived_rank[fid])
+        if _USE_CONTEXT_BM25 and fid in context_rank:
+            s += 1.0 / (_RRF_K + context_rank[fid])
         if fid in entity_rank:
             s += 1.0 / (_RRF_K + entity_rank[fid])
         raw_rrf[fid] = s
     max_rrf = max(raw_rrf.values()) if raw_rrf else 1.0
 
-    # ── 6. Combined score per fact ─────────────────────────────────────────
-    # Preload session indices for session_recency scoring (one DB read, not per-fact).
-    session_idx_map: dict[str, int] = {}
-    try:
-        for _sid, _sidx in conn.execute(
-            "SELECT session_id, session_index FROM sessions WHERE project_id = ?",
-            (project_id,),
-        ).fetchall():
-            session_idx_map[_sid] = _sidx
-    except Exception:
-        pass
+    # Sort broad pool by RRF, append tail (facts not in broad pool) sorted by RRF
+    if _BROAD_POOL > 0:
+        _broad_sorted = sorted(_broad_cands, key=lambda f: raw_rrf.get(f, 0.0), reverse=True)
+        _tail_sorted = sorted(
+            (fid for fid, *_ in rows if fid not in _broad_set),
+            key=lambda f: raw_rrf.get(f, 0.0), reverse=True
+        )
+        _rerank_order = _broad_sorted + _tail_sorted
+    else:
+        _rerank_order = sorted(raw_rrf, key=raw_rrf.__getitem__, reverse=True)
+    # Snapshot pre-score order for coverage guard
+    _pre_score_order = list(_rerank_order) if _COVERAGE_K > 0 else None
 
-    now = datetime.now(timezone.utc)
-    scored_all: list = []
-    for fid, content, _emb, rc, ca, ft, ef, lra, ivd, _ents, _imp, fsid in rows:
-        rrf = (raw_rrf[fid] / max_rrf) if max_rrf > 0 else 0.0
+    # ── 8. Combined score per fact ─────────────────────────────────────────
+    if _RETRIEVE_BENCHMARK:
+        # Benchmark mode: use pure RRF order as scores (no composite scoring).
+        scored_all = [
+            (raw_rrf.get(fid, 0.0), fid, content_by_fid[fid], 2.5, None, 0)
+            for fid in _rerank_order
+        ]
+    else:
+        # Preload session indices for session_recency scoring (one DB read, not per-fact).
+        session_idx_map: dict[str, int] = {}
         try:
-            ca_dt = _parse_dt(ca)
+            for _sid, _sidx in conn.execute(
+                "SELECT session_id, session_index FROM sessions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall():
+                session_idx_map[_sid] = _sidx
         except Exception:
-            ca_dt = now
-        days = max(0, (now - ca_dt).days)
-        decay = _DECAY_RATES.get(ft, _DECAY_RATES["note"])
-        recency = 1.0 / (1.0 + decay * days) if decay > 0 else 1.0
-        freq = (rc / max_rc) if max_rc > 0 else 0.0
-        staleness = min((now_ts - lra) / (30 * 86400), 1.0) if lra is not None else 1.0
-        session_rec = _session_recency_score(fsid, session_id, session_idx_map)
-        # Weights sum to 1.0. importance dropped — encoded in easiness_factor at insert time.
-        score = 0.35 * rrf + 0.20 * recency + 0.20 * staleness + 0.15 * session_rec + 0.10 * freq
-        # Step 6: demote window facts so atomic SVO notes rank above them.
-        # Turn facts (clean [curr] text) are NOT demoted — they are the precise answer unit.
-        if ft == "window":
-            score *= _WINDOW_DEMOTION
-        # Speaker boost: if a speaker name appears in the question AND this is a turn
-        # fact whose content starts with that speaker, boost by 1.3x.  Helps single-hop
-        # questions like "What did Alice say about X?" where the answer is Alice's turn.
-        if ft == "turn" and ": " in content:
-            turn_speaker = content.split(":", 1)[0].strip()
-            if turn_speaker and turn_speaker.lower() in prompt.lower():
-                score *= 1.3
-        # (score, fid, content, ef, lra, rc)
-        scored_all.append((score, fid, content, ef, lra, rc))
-    scored_all.sort(reverse=True, key=lambda x: x[0])
+            pass
+
+        now = datetime.now(timezone.utc)
+        row_by_fid: dict[int, tuple] = {r[0]: r for r in rows}
+        scored_all: list = []
+        for fid in _rerank_order:
+            r = row_by_fid.get(fid)
+            if r is None:
+                continue
+            _fid, content, _emb, rc, ca, ft, ef, lra, ivd, _ents, _imp, fsid = r
+            rrf = (raw_rrf[fid] / max_rrf) if max_rrf > 0 else 0.0
+            try:
+                ca_dt = _parse_dt(ca)
+            except Exception:
+                ca_dt = now
+            days = max(0, (now - ca_dt).days)
+            decay = _DECAY_RATES.get(ft, _DECAY_RATES["note"])
+            recency = 1.0 / (1.0 + decay * days) if decay > 0 else 1.0
+            freq = (rc / max_rc) if max_rc > 0 else 0.0
+            staleness = min((now_ts - lra) / (30 * 86400), 1.0) if lra is not None else 1.0
+            session_rec = _session_recency_score(fsid, session_id, session_idx_map)
+            # Weights sum to 1.0.
+            score = 0.35 * rrf + 0.20 * recency + 0.20 * staleness + 0.15 * session_rec + 0.10 * freq
+            # Window demotion (adjustable via PREFLIGHT_WINDOW_DEMOTION, default 1.0 = no demotion).
+            if ft == "window":
+                score *= _WINDOW_DEMOTION
+            # Speaker boost: if a speaker name appears in the question AND this is a turn
+            # fact whose content starts with that speaker, boost by 1.3x.
+            if ft == "turn" and ": " in content:
+                turn_speaker = content.split(":", 1)[0].strip()
+                if turn_speaker and turn_speaker.lower() in prompt.lower():
+                    score *= 1.3
+            scored_all.append((score, fid, content, ef, lra, rc))
+
+        # Coverage guard: min-rank ensemble of score rank and pre-score (RRF) rank.
+        # Ensures R@K cannot regress below the baseline ordering.
+        if _COVERAGE_K > 0 and _pre_score_order is not None:
+            _score_rank = {r[1]: i for i, r in enumerate(scored_all)}
+            _baseline_rank = {fid: i for i, fid in enumerate(_pre_score_order)}
+            _n_ids = len(scored_all)
+            scored_all.sort(key=lambda r: min(
+                _score_rank.get(r[1], _n_ids),
+                _baseline_rank.get(r[1], _n_ids),
+            ))
 
     # Stage 1: post-scoring position.
     if _gold_fid is not None:
@@ -1508,8 +1724,16 @@ def retrieve_facts(
     # ── 7. SM-2 gate (disabled by default — _SM2_GATE_ENABLED=False) ─────
     # Gate is skipped because unseen facts (retrieval_count=0) would be blocked
     # before scoring. EF/interval fields still update on retrieval for staleness.
+    def _safe_ivd(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, (bytes, bytearray)) and len(v) == 4:
+            import struct as _si
+            return float(_si.unpack("f", v)[0])
+        return 1.0
+
     _lra_by_fid = {r[0]: r[7] for r in rows}
-    _ivd_by_fid = {r[0]: r[8] for r in rows}
+    _ivd_by_fid = {r[0]: _safe_ivd(r[8]) for r in rows}
     _ef_by_fid  = {r[0]: float(r[6]) for r in rows}
     _sta_by_fid = {r[0]: min((now_ts - r[7]) / (30 * 86400), 1.0)
                    if r[7] is not None else 1.0 for r in rows}
@@ -1536,42 +1760,63 @@ def retrieve_facts(
         _stages["gated_pos"] = _g_fids.index(_gold_fid) if _gold_fid in _g_fids else -1
         _stages["gated_size"] = len(_g_fids)
 
-    # ── 8. Cross-encoder reranking (Phase 4) — runs on pure top-20 by score ─
-    # CE sees the top-20 by composite score (no MMR demotion yet), giving it the
-    # highest-relevance candidates. MMR runs post-CE for output deduplication only.
+    # ── 9. Cross-encoder reranking (Phase 4) — bigger pool, clean [curr] text ─
+    # CE extracts only the [curr] line from window facts — the full [prev]/[curr]/[next]
+    # format confuses cross-encoder models trained on clean (query, passage) pairs.
+    # Pool size controlled by _CE_POOL_SIZE (default 120; benchmark found 200 optimal).
     quality_by_fid: dict[int, float] = {}
+    _pre_ce_order = list(scored) if _CE_GUARD_K > 0 else None
     try:
         cross_enc = _get_cross_encoder()
         if cross_enc is not None and len(scored) > 5:
-            top20 = scored[:40]
+            ce_pool = scored[:_CE_POOL_SIZE]
             # BM25 anchor: guarantee top-5 BM25 facts enter the CE pool even if
-            # composite scoring pushed them past position 40.
+            # composite scoring pushed them past the pool boundary.
             if bm25_rank:
-                top20_fids = {r[1] for r in top20}
+                pool_fids = {r[1] for r in ce_pool}
                 bm25_anchors = [
-                    row for row in scored[40:]
+                    row for row in scored[_CE_POOL_SIZE:]
                     if row[1] in bm25_rank and bm25_rank[row[1]] < 5
-                    and row[1] not in top20_fids
+                    and row[1] not in pool_fids
                 ]
                 if bm25_anchors:
-                    top20 = top20 + bm25_anchors
-            ce_pool_fids = {r[1] for r in top20}
-            pairs = [(prompt, c) for _, _, c, *_ in top20]
+                    ce_pool = ce_pool + bm25_anchors
+            ce_pool_fids = {r[1] for r in ce_pool}
+
+            # Extract [curr] line for CE input (full window format confuses CE)
+            def _curr_text(raw: str) -> str:
+                for ln in raw.split("\n"):
+                    if ln.startswith("[curr] "):
+                        return ln[len("[curr] "):]
+                return raw
+
+            pairs = [(prompt, _curr_text(c)) for _, _, c, *_ in ce_pool]
             t0 = time.time()
             ce_raw = cross_enc.predict(pairs)
-            if time.time() - t0 < 3.0:
+            if time.time() - t0 < _CE_TIMEOUT:
                 ce_min = min(ce_raw)
                 ce_max = max(ce_raw)
                 ce_range = ce_max - ce_min if ce_max > ce_min else 1.0
-                for i, (_, fid, *_rest) in enumerate(top20):
+                for i, (_, fid, *_rest) in enumerate(ce_pool):
                     quality_by_fid[fid] = float(ce_raw[i] - ce_min) / ce_range
-                reranked_top20 = sorted(
+                reranked_pool = sorted(
                     [(quality_by_fid[fid], fid, c, ef, lra, rc)
-                     for _, fid, c, ef, lra, rc in top20],
+                     for _, fid, c, ef, lra, rc in ce_pool],
                     reverse=True,
                 )
                 scored_tail = [r for r in scored if r[1] not in ce_pool_fids]
-                scored = reranked_top20 + scored_tail
+                scored = reranked_pool + scored_tail
+
+                # CE guard: min-rank ensemble of CE rank and pre-CE rank.
+                # Prevents CE from pushing items out of top positions.
+                if _CE_GUARD_K > 0 and _pre_ce_order is not None:
+                    _ce_rank = {r[1]: i for i, r in enumerate(scored)}
+                    _pre_ce_rank = {r[1]: i for i, r in enumerate(_pre_ce_order)}
+                    _n_ce = len(scored)
+                    scored.sort(key=lambda r: min(
+                        _ce_rank.get(r[1], _n_ce),
+                        _pre_ce_rank.get(r[1], _n_ce),
+                    ))
     except Exception:
         pass
 
@@ -1584,7 +1829,7 @@ def retrieve_facts(
     # _MMR_LAMBDA_POST_CE=0.25 applies light diversity on what is returned to the user.
     # The CE has already seen the true top-20 by relevance, so MMR here only removes
     # near-duplicate results from the final returned set.
-    if len(scored) > 5:
+    if not _RETRIEVE_BENCHMARK and len(scored) > 5:
         selected_embs: list = []
         mmr_selected: list = []
         remaining = list(scored)
@@ -1638,46 +1883,54 @@ def retrieve_facts(
         primary_ids.append(fid)
 
         # SM-2 EF update: cross-encoder quality proxy when available, else RRF score.
-        quality = quality_by_fid.get(
-            fid, (raw_rrf.get(fid, 0) / max_rrf) if max_rrf > 0 else 0.5
-        )
-        new_ef = max(1.3, ef + 0.1 - (1.0 - quality) * 0.5)
-        new_ivd = new_ef * (1.0 + (rc + 1) * 0.1)
-        conn.execute(
-            """UPDATE facts
-               SET retrieval_count = retrieval_count + 1,
-                   last_retrieved_at = ?,
-                   easiness_factor = ?,
-                   interval_days = ?
-               WHERE id = ?""",
-            (now_ts, round(new_ef, 4), round(new_ivd, 4), fid),
-        )
+        if not _RETRIEVE_BENCHMARK:
+            quality = quality_by_fid.get(
+                fid, (raw_rrf.get(fid, 0) / max_rrf) if max_rrf > 0 else 0.5
+            )
+            new_ef = max(1.3, ef + 0.1 - (1.0 - quality) * 0.5)
+            new_ivd = new_ef * (1.0 + (rc + 1) * 0.1)
+            conn.execute(
+                """UPDATE facts
+                   SET retrieval_count = retrieval_count + 1,
+                       last_retrieved_at = ?,
+                       easiness_factor = ?,
+                       interval_days = ?
+                   WHERE id = ?""",
+                (now_ts, round(new_ef, 4), round(new_ivd, 4), fid),
+            )
 
-    # ── 10. Graph expansion ───────────────────────────────────────────────
-    # Commit before opening a second connection in get_related_facts().
-    conn.commit()
-    conn.close()
+    if not _RETRIEVE_BENCHMARK:
+        # ── 10. Graph expansion ───────────────────────────────────────────
+        # Commit before opening a second connection in get_related_facts().
+        conn.commit()
+        conn.close()
 
-    seen_content: set[str] = set(results)
-    extra_cap = top_n + 3
-    for fid in primary_ids:
-        if len(results) >= extra_cap:
-            break
-        for neighbour in get_related_facts(fid, depth=1):
+        seen_content: set[str] = set(results)
+        extra_cap = top_n + 3
+        for fid in primary_ids:
             if len(results) >= extra_cap:
                 break
-            nc = neighbour["content"]
-            if nc not in seen_content:
-                seen_content.add(nc)
-                results.append(nc)
+            for neighbour in get_related_facts(fid, depth=1):
+                if len(results) >= extra_cap:
+                    break
+                nc = neighbour["content"]
+                if nc not in seen_content:
+                    seen_content.add(nc)
+                    results.append(nc)
+    else:
+        conn.close()
 
     if include_budget_info:
-        ret = {
+        ret: dict = {
             "facts": results,
             "budget_hit": budget_hit,
             "retrieved_count": len(results),
             "total_candidates": total_candidates,
         }
+        if _RETRIEVE_BENCHMARK:
+            ret["fids"] = primary_ids
+            ret["all_ranked_fids"] = [r[1] for r in scored]
+            ret["all_ranked_scores"] = [r[0] for r in scored]
         if _gold_fid is not None:
             _gold_ids = [fid for fid in primary_ids]
             _stages["final_pos"] = _gold_ids.index(_gold_fid) if _gold_fid in _gold_ids else -1

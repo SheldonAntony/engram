@@ -1,0 +1,34 @@
+# engram — Python dependencies
+# Python >= 3.10 required
+#
+# All stdlib modules (hashlib, json, os, re, sqlite3, struct, sys, time,
+# datetime, urllib) are included automatically — nothing to install for those.
+
+# ── Required ──────────────────────────────────────────────────────────────────
+
+# Default embedding backend.  Provides BAAI/bge-small-en-v1.5 out of the box
+# with no extra model downloads.  Switch to sentence-transformers if you want
+# to use a fine-tuned local model (set ENGRAM_EMBED_BACKEND=sentence-transformers).
+fastembed>=0.3.0
+
+# ── Optional: fine-tuned / custom embedding models ───────────────────────────
+# Uncomment if you set ENGRAM_EMBED_BACKEND=sentence-transformers
+# and point ENGRAM_EMBED_MODEL at a local path or HF model ID.
+# sentence-transformers>=3.0.0
+
+# ── Optional: numpy (vector operations) ──────────────────────────────────────
+# memory.py uses numpy when available for faster cosine similarity over large
+# corpora.  Falls back to pure-Python if absent — no behaviour change.
+# numpy>=1.24.0
+
+# ── Optional: spaCy + model (entity extraction) ───────────────────────────────
+# Improves recall on queries that contain named entities (people, orgs, places,
+# code identifiers).  Gracefully disabled if not installed.
+# spacy>=3.7.0
+# After installing spaCy, also run:  python -m spacy download en_core_web_sm
+
+# ── Optional: Ollama (local LLM fact extraction) ──────────────────────────────
+# llm_extractor.py talks to Ollama over HTTP (localhost:11434) using only
+# stdlib urllib — no Python package required.  Just install Ollama itself and:
+#   ollama pull qwen2.5:1.5b
+# Then set PREFLIGHT_USE_LLM_EXTRACTOR=1 to enable.

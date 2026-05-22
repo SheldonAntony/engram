@@ -89,7 +89,7 @@ _cross_encoder_tried = False
 _cross_encoder_model_name: str = ""
 
 _CE_MODEL_NAME = os.environ.get(
-    "PREFLIGHT_CE_MODEL", "mixedbread-ai/mxbai-rerank-xsmall-v1"
+    "PREFLIGHT_CE_MODEL", "BAAI/bge-reranker-v2-m3"
 )
 
 
