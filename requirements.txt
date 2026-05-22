@@ -11,6 +11,10 @@
 # to use a fine-tuned local model (set ENGRAM_EMBED_BACKEND=sentence-transformers).
 fastembed>=0.3.0
 
+# ── MCP server ──────────────────────────────────────────────────────────────
+# Required to run engram as an MCP server (Claude Desktop, Cursor, etc.).
+mcp>=1.0.0
+
 # ── Optional: fine-tuned / custom embedding models ───────────────────────────
 # Uncomment if you set ENGRAM_EMBED_BACKEND=sentence-transformers
 # and point ENGRAM_EMBED_MODEL at a local path or HF model ID.

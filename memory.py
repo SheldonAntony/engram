@@ -118,7 +118,7 @@ _SM2_GATE_ENABLED = True
 
 # ── Tunable retrieval constants ───────────────────────────────────────────────
 # All can be overridden via env vars for deployment tuning.
-_POOL_A_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_A", "750"))   # ANN pool size
+_POOL_A_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_A", "99999")) # ANN pool cap (default: all facts)
 _POOL_B_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_B", "300"))   # proven-useful pool
 _RRF_K                 = int(os.environ.get("PREFLIGHT_RRF_K", "15"))     # RRF smoothing (15=tight, 60=loose)
 _BROAD_POOL            = int(os.environ.get("PREFLIGHT_BROAD_POOL", "200")) # union top-N from each signal
@@ -600,9 +600,16 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col: str,
     try:
         conn.execute(f"SELECT {col} FROM {table} LIMIT 1")
     except sqlite3.OperationalError:
-        conn.execute(
-            f"ALTER TABLE {table} ADD COLUMN {col} {col_type} DEFAULT {default}"
-        )
+        _is_expr = default.startswith("(") and default.endswith(")")
+        try:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {col} {col_type} "
+                f"DEFAULT {'0' if _is_expr else default}"
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {col} {col_type} DEFAULT 0"
+            )
 
 
 def _encode_embedding(vec: list[float]) -> bytes:
@@ -1298,7 +1305,7 @@ def retrieve_facts(
             if qnorm > 0:
                 qvec = qvec / qnorm
             sims = cached_mat @ qvec          # shape (N,), cosine similarity
-            top_k = len(cached_fids) if _RETRIEVE_BENCHMARK else min(_POOL_A_LIMIT, len(cached_fids))
+            top_k = len(cached_fids)
             top_indices = np.argpartition(sims, -top_k)[-top_k:]
             top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
             top_fids = [cached_fids[i] for i in top_indices]
@@ -1317,16 +1324,16 @@ def retrieve_facts(
         # Fallback: recency order (original behaviour), used when numpy unavailable
         # or cache is empty (no facts stored yet).
         pool_a = conn.execute(
-            f"SELECT {_COLS} FROM facts WHERE {_WHERE} ORDER BY id DESC LIMIT ?",
-            (project_id, _POOL_A_LIMIT),
+            f"SELECT {_COLS} FROM facts WHERE {_WHERE}",
+            (project_id,),
         ).fetchall()
 
     pool_a_ids = {r[0] for r in pool_a}
     if not _RETRIEVE_BENCHMARK:
         pool_b_raw = conn.execute(
             f"SELECT {_COLS} FROM facts WHERE {_WHERE} AND retrieval_count > 0 "
-            f"ORDER BY retrieval_count DESC, last_retrieved_at DESC LIMIT ?",
-            (project_id, _POOL_A_LIMIT + _POOL_B_LIMIT),
+            f"ORDER BY retrieval_count DESC, last_retrieved_at DESC",
+            (project_id,),
         ).fetchall()
         pool_b = [r for r in pool_b_raw if r[0] not in pool_a_ids][:_POOL_B_LIMIT]
         all_candidate_rows = pool_a + pool_b
@@ -1784,6 +1791,9 @@ def retrieve_facts(
             ce_pool_fids = {r[1] for r in ce_pool}
 
             # Extract [curr] line for CE input (full window format confuses CE)
+            from functools import lru_cache as _lru_cache
+
+            @_lru_cache(maxsize=256)
             def _curr_text(raw: str) -> str:
                 for ln in raw.split("\n"):
                     if ln.startswith("[curr] "):
@@ -1813,8 +1823,9 @@ def retrieve_facts(
                     _ce_rank = {r[1]: i for i, r in enumerate(scored)}
                     _pre_ce_rank = {r[1]: i for i, r in enumerate(_pre_ce_order)}
                     _n_ce = len(scored)
-                    scored.sort(key=lambda r: min(
-                        _ce_rank.get(r[1], _n_ce),
+                    scored.sort(key=lambda r: (
+                        min(_ce_rank.get(r[1], _n_ce),
+                            _pre_ce_rank.get(r[1], _n_ce)),
                         _pre_ce_rank.get(r[1], _n_ce),
                     ))
     except Exception:

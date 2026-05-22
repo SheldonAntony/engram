@@ -2,7 +2,7 @@
 
 Persistent semantic memory for AI coding agents.
 
-engram is a [opencode](https://opencode.ai) plugin that gives AI coding agents long-term memory — facts, decisions, preferences, and conversation context persist across sessions.
+engram is an [opencode](https://opencode.ai) plugin with an [MCP server](https://modelcontextprotocol.io) for AI agents to store and retrieve long-term memory — facts, decisions, preferences, and conversation context.
 
 **~78% R@3 on LoCoMo** — all signals are algorithmic. No training data, no cloud APIs, no GPU required.
 
@@ -99,6 +99,26 @@ python memory.py retrieve_facts test-project test-session "what is the architect
 
 Expected: `[]` on a fresh install (no facts stored yet).
 
+### MCP clients (Claude Desktop, Cursor, etc.)
+
+Run the MCP server and configure your client to connect via stdio:
+
+```bash
+python server.py
+```
+
+For Claude Desktop, add to `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "python",
+      "args": ["/path/to/engram/server.py"]
+    }
+  }
+}
+```
+
 ---
 
 ## Configuration
@@ -135,7 +155,7 @@ Edit `preflight.config.json`:
 | Platform | Status |
 |----------|--------|
 | [opencode](https://opencode.ai) | Supported (native plugin) |
-| MCP (Claude Code, Cursor, etc.) | Planned |
+| [MCP](https://modelcontextprotocol.io) clients (Claude Desktop, Cursor, etc.) | Supported (run `python server.py`) |
 
 ---
 
