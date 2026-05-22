@@ -18,12 +18,15 @@ CLI usage:
 
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import re
 import sqlite3
 import struct
 import sys
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 try:
@@ -125,6 +128,7 @@ _BROAD_POOL            = int(os.environ.get("PREFLIGHT_BROAD_POOL", "200")) # un
 _USE_DERIVED_BM25      = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
 _USE_LEXICAL_CHANNELS  = os.environ.get("PREFLIGHT_USE_LEXICAL_CHANNELS", "0") == "1"
 _USE_CONTEXT_BM25      = os.environ.get("PREFLIGHT_USE_CONTEXT_BM25", "0") == "1"
+_USE_QUERY_DECOMPOSITION = os.environ.get("PREFLIGHT_USE_QUERY_DECOMPOSITION", "0") == "1"
 _CONTEXT_WINDOW_SIZE   = int(os.environ.get("PREFLIGHT_CONTEXT_WINDOW", "3"))
 _CE_POOL_SIZE          = int(os.environ.get("PREFLIGHT_CE_POOL", "120"))   # candidates fed to CE (benchmark: 200)
 _CE_TIMEOUT            = float(os.environ.get("PREFLIGHT_CE_TIMEOUT", "5.0")) # max seconds for CE (bigger model needs more)
@@ -164,30 +168,36 @@ _BM25_STOPWORDS = frozenset({
 # Keyed by project_id → (fid_list, emb_matrix) where emb_matrix is shape (N, D).
 # Populated lazily on first retrieve call for a project.
 # _cache_dirty tracks which projects need a reload after a write.
-_EMB_CACHE: "dict[str, tuple[list[int], object]]" = {}
+_EMB_CACHE_MAX_SIZE = 50
+_EMB_CACHE: "OrderedDict[str, tuple[list[int], object]]" = OrderedDict()
+_EMB_CACHE_LOCK = threading.Lock()
 _CACHE_DIRTY: "set[str]" = set()
+_CACHE_DIRTY_LOCK = threading.Lock()
 
 # ── spaCy lazy loader (Step 6 SVO extraction) ────────────────────────────────
 # Set to None before first use, False after a failed load attempt.
 _nlp = None
+_NLP_LOCK = threading.Lock()
 _WINDOW_TAG_RE = re.compile(r'^\[(prev|curr|next)\]\s*')
 
 
 def _get_nlp():
     """Return a loaded spaCy en_core_web_sm model, or None if unavailable."""
     global _nlp
-    if _nlp is None:
-        try:
-            import spacy  # noqa: PLC0415
-            _nlp = spacy.load("en_core_web_sm")
-        except Exception:
-            _nlp = False
+    with _NLP_LOCK:
+        if _nlp is None:
+            try:
+                import spacy  # noqa: PLC0415
+                _nlp = spacy.load("en_core_web_sm")
+            except Exception:
+                _nlp = False
     return _nlp if _nlp is not False else None
 
 
 # ── Derived FTS helpers ────────────────────────────────────────────────────────
 
 _WORDNET_AVAILABLE: "bool | None" = None  # None=untested, True/False=cached
+_WORDNET_LOCK = threading.Lock()
 
 # Common question/function words that should never be expanded via WordNet.
 # Expanding these produces domain-wrong hypernyms (e.g. "does"→"do"→verb chain,
@@ -236,6 +246,26 @@ def _build_derived_text(text: str) -> str:
     """
     global _WORDNET_AVAILABLE
 
+    # One-time WordNet availability check (locked for thread safety).
+    with _WORDNET_LOCK:
+        if _WORDNET_AVAILABLE is None:
+            try:
+                from nltk.corpus import wordnet as _wn  # noqa: PLC0415
+                _wn.synsets("test")
+                _WORDNET_AVAILABLE = True
+            except LookupError:
+                try:
+                    import nltk  # noqa: PLC0415
+                    nltk.download("wordnet", quiet=True)
+                    nltk.download("omw-1.4", quiet=True)
+                    from nltk.corpus import wordnet as _wn  # noqa: PLC0415
+                    _wn.synsets("test")
+                    _WORDNET_AVAILABLE = True
+                except Exception:
+                    _WORDNET_AVAILABLE = False
+            except ImportError:
+                _WORDNET_AVAILABLE = False
+
     # Preserve speaker prefix; expand body only.
     if ": " in text:
         speaker, _, body = text.partition(": ")
@@ -248,25 +278,6 @@ def _build_derived_text(text: str) -> str:
 
     if not tokens:
         return text.lower()
-
-    # One-time WordNet availability check.
-    if _WORDNET_AVAILABLE is None:
-        try:
-            from nltk.corpus import wordnet as _wn  # noqa: PLC0415
-            _wn.synsets("test")
-            _WORDNET_AVAILABLE = True
-        except LookupError:
-            try:
-                import nltk  # noqa: PLC0415
-                nltk.download("wordnet", quiet=True)
-                nltk.download("omw-1.4", quiet=True)
-                from nltk.corpus import wordnet as _wn  # noqa: PLC0415
-                _wn.synsets("test")
-                _WORDNET_AVAILABLE = True
-            except Exception:
-                _WORDNET_AVAILABLE = False
-        except ImportError:
-            _WORDNET_AVAILABLE = False
 
     if not _WORDNET_AVAILABLE:
         parts = ([speaker] if speaker else []) + tokens
@@ -429,7 +440,6 @@ def init_db() -> sqlite3.Connection:
             created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             valid_from        REAL    DEFAULT (unixepoch()),
             superseded_at     REAL    DEFAULT NULL,
-            valid_to          REAL    DEFAULT NULL,
             source_session    TEXT,
             source_hash       TEXT,
             easiness_factor   REAL    DEFAULT 2.5,
@@ -499,7 +509,6 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "facts",      "fact_type",       "TEXT",      "'note'")
     _ensure_column(conn, "facts",      "valid_from",        "REAL",      "(unixepoch())")
     _ensure_column(conn, "facts",      "superseded_at",     "REAL",      "NULL")
-    _ensure_column(conn, "facts",      "valid_to",          "REAL",      "NULL")
     _ensure_column(conn, "facts",      "source_session",    "TEXT",      "NULL")
     _ensure_column(conn, "facts",      "source_hash",       "TEXT",      "NULL")
     _ensure_column(conn, "facts",      "easiness_factor",   "REAL",      "2.5")
@@ -568,7 +577,7 @@ def init_db() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_relations_b ON fact_relations(fact_id_b)"
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_facts_live ON facts (superseded_at, valid_to)"
+        "CREATE INDEX IF NOT EXISTS idx_facts_live ON facts (superseded_at)"
     )
 
     # Backfill FTS5 index from any pre-existing facts (one-time, cheap if empty).
@@ -730,9 +739,7 @@ def get_graph(project_id: str, query: str, depth: int = 1) -> dict:
     conn = init_db()
     cursor = conn.execute(
         """SELECT id, content, embedding FROM facts
-           WHERE project_id = ?
-             AND superseded_at IS NULL
-             AND (valid_to IS NULL OR valid_to > unixepoch())
+           WHERE project_id = ? AND superseded_at IS NULL
            ORDER BY id DESC LIMIT 200""",
         (project_id,),
     )
@@ -765,6 +772,7 @@ def get_graph(project_id: str, query: str, depth: int = 1) -> dict:
 # ─── Facts (semantic memory) ──────────────────────────────────────────────────
 
 _compacted_this_process = False
+_COMPACTED_LOCK = threading.Lock()
 
 
 def _compact_old_mutations(conn: sqlite3.Connection) -> None:
@@ -792,6 +800,24 @@ def _get_cross_encoder():
         return None
 
 
+def _ce_predict_worker(pairs: list, result_queue) -> None:
+    """Load cross-encoder in subprocess and predict with timeout killability.
+
+    Must be a top-level function (not nested) to be picklable by multiprocessing.
+    Uses fork semantics (Linux default) so the model is inherited copy-on-write
+    and does not need to be reloaded from disk.
+    """
+    try:
+        from utils import get_cross_encoder  # noqa: PLC0415
+        ce = get_cross_encoder()
+        if ce is None:
+            return
+        result = ce.predict(pairs)
+        result_queue.put(result)
+    except Exception:
+        pass
+
+
 def store_fact(project_id: str, session_id: str, text: str,
                fact_type: str = "note", enrich: bool = True,
                _embed_text: "str | None" = None,
@@ -816,16 +842,15 @@ def store_fact(project_id: str, session_id: str, text: str,
     the same curr_line text), halving the number of model inference calls.
     """
     global _compacted_this_process
+    with _COMPACTED_LOCK:
+        if not _compacted_this_process:
+            _compact_old_mutations(conn)
+            _compacted_this_process = True
     if _precomputed_emb is not None:
         emb = _precomputed_emb
     else:
         emb = embed_text(_embed_text if _embed_text is not None else text)
     conn = init_db()
-
-    # Phase 7.5: compact old INSERT mutations once per process lifetime.
-    if not _compacted_this_process:
-        _compact_old_mutations(conn)
-        _compacted_this_process = True
 
     # Find the most-similar live fact in this project (last 200).
     # Window facts are intentionally overlapping (sharing 2 of 3 turns) so
@@ -839,9 +864,7 @@ def store_fact(project_id: str, session_id: str, text: str,
     if fact_type not in ("window", "turn", "llm_atomic"):
         cursor = conn.execute(
             """SELECT id, embedding FROM facts
-               WHERE project_id = ?
-                 AND superseded_at IS NULL
-                 AND (valid_to IS NULL OR valid_to > unixepoch())
+               WHERE project_id = ? AND superseded_at IS NULL
                ORDER BY id DESC LIMIT 200""",
             (project_id,),
         )
@@ -1019,9 +1042,7 @@ def store_fact(project_id: str, session_id: str, text: str,
     if fact_type not in ("window", "turn", "llm_atomic"):
         link_cursor = conn.execute(
             """SELECT id, content, embedding FROM facts
-               WHERE project_id = ? AND id != ?
-                 AND superseded_at IS NULL
-                 AND (valid_to IS NULL OR valid_to > unixepoch())
+               WHERE project_id = ? AND id != ? AND superseded_at IS NULL
                ORDER BY id DESC LIMIT 50""",
             (project_id, saved_id),
         )
@@ -1071,7 +1092,8 @@ def store_fact(project_id: str, session_id: str, text: str,
     conn.close()
     # Invalidate the ANN embedding cache for this project so the next
     # retrieve_facts() call reloads fresh embeddings including this new fact.
-    _CACHE_DIRTY.add(project_id)
+    with _CACHE_DIRTY_LOCK:
+        _CACHE_DIRTY.add(project_id)
     return saved_id
 
 
@@ -1087,6 +1109,51 @@ def _fts5_query(prompt: str) -> str:
         return ""
     # Quote each token to avoid FTS5 keyword collisions (AND/OR/NOT/NEAR).
     return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def _decompose_query(query: str) -> list[str]:
+    """ToR-Lite query decomposition via embedding similarity valleys.
+
+    Embeds each word independently, computes sliding-window similarity,
+    splits at valleys (sim < 0.7), snaps splits to nearest conjunction,
+    and returns sub-queries.  Short queries (<=4 words) pass through unchanged.
+    Returns [query] when only one sub-query would be produced.
+    """
+    words = query.strip().split()
+    if len(words) <= 4:
+        return [query]
+
+    word_embs = [embed_text(w) for w in words]
+    similarities = [
+        cosine_similarity(word_embs[i], word_embs[i + 1])
+        for i in range(len(words) - 1)
+    ]
+
+    splits = [i for i, sim in enumerate(similarities) if sim < 0.7]
+
+    conjunctions = {"and", "but", "or", "then", "before", "after"}
+    final_splits: list[int] = []
+    for split in splits:
+        snapped = False
+        for offset in range(-2, 3):
+            idx = split + offset
+            if 0 <= idx < len(words) and words[idx].lower() in conjunctions:
+                final_splits.append(idx)
+                snapped = True
+                break
+        if not snapped:
+            final_splits.append(split)
+
+    sub_queries: list[str] = []
+    prev = 0
+    for split in sorted(set(final_splits)):
+        sub = " ".join(words[prev:split + 1])
+        if len(sub.split()) >= 3:
+            sub_queries.append(sub)
+        prev = split + 1
+    sub_queries.append(" ".join(words[prev:]))
+
+    return sub_queries if len(sub_queries) > 1 else [query]
 
 
 def _session_recency_score(
@@ -1261,41 +1328,49 @@ def retrieve_facts(
         "COALESCE(importance, 0.5), session_id"
     )
     _WHERE = (
-        "project_id = ? AND superseded_at IS NULL "
-        "AND (valid_to IS NULL OR valid_to > unixepoch())"
+        "project_id = ? AND superseded_at IS NULL"
     )
 
     # ── Pool A: ANN via in-process embedding cache ────────────────────────
     # Cache stores (fid_list, emb_matrix) per project. Rebuilt when dirty.
     pool_a: list = []
     if _NUMPY_AVAILABLE:
-        if project_id in _CACHE_DIRTY or project_id not in _EMB_CACHE:
-            # Load all live fact IDs + embeddings for this project.
-            cache_rows = conn.execute(
-                "SELECT id, embedding FROM facts WHERE project_id = ? "
-                "AND superseded_at IS NULL "
-                "AND (valid_to IS NULL OR valid_to > unixepoch())",
-                (project_id,),
-            ).fetchall()
-            cache_fids: list[int] = []
-            cache_vecs: list = []
-            for cfid, cemb_blob in cache_rows:
-                vec = _decode_embedding(cemb_blob)
-                if vec is not None:
-                    cache_fids.append(cfid)
-                    cache_vecs.append(vec)
-            if cache_vecs:
-                mat = np.array(cache_vecs, dtype=np.float32)
-                # Normalise rows so dot product == cosine similarity.
-                norms = np.linalg.norm(mat, axis=1, keepdims=True)
-                norms = np.where(norms == 0, 1.0, norms)
-                mat = mat / norms
-                _EMB_CACHE[project_id] = (cache_fids, mat)
-            else:
-                _EMB_CACHE[project_id] = ([], None)
-            _CACHE_DIRTY.discard(project_id)
+        with _EMB_CACHE_LOCK:
+            if project_id in _CACHE_DIRTY or project_id not in _EMB_CACHE:
+                # Load all live fact IDs + embeddings for this project.
+                cache_rows = conn.execute(
+                    "SELECT id, embedding FROM facts WHERE project_id = ? "
+                    "AND superseded_at IS NULL",
+                    (project_id,),
+                ).fetchall()
+                cache_fids: list[int] = []
+                cache_vecs: list = []
+                for cfid, cemb_blob in cache_rows:
+                    vec = _decode_embedding(cemb_blob)
+                    if vec is not None:
+                        cache_fids.append(cfid)
+                        cache_vecs.append(vec)
+                if cache_vecs:
+                    mat = np.array(cache_vecs, dtype=np.float32)
+                    # Normalise rows so dot product == cosine similarity.
+                    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                    norms = np.where(norms == 0, 1.0, norms)
+                    mat = mat / norms
+                    _EMB_CACHE[project_id] = (cache_fids, mat)
+                    _EMB_CACHE.move_to_end(project_id)
+                    # LRU eviction: drop least recently used project cache.
+                    while len(_EMB_CACHE) > _EMB_CACHE_MAX_SIZE:
+                        _EMB_CACHE.popitem(last=False)
+                else:
+                    _EMB_CACHE[project_id] = ([], None)
+                with _CACHE_DIRTY_LOCK:
+                    _CACHE_DIRTY.discard(project_id)
 
-        cached_fids, cached_mat = _EMB_CACHE.get(project_id, ([], None))
+        with _EMB_CACHE_LOCK:
+            cached_fids, cached_mat = _EMB_CACHE.get(project_id, ([], None))
+        if project_id in _EMB_CACHE:
+            with _EMB_CACHE_LOCK:
+                _EMB_CACHE.move_to_end(project_id)
         if cached_mat is not None and len(cached_fids) > 0:
             # Embed the bare prompt for ANN pool selection.
             # (augmented_prompt is built later after pool; vector ranking step uses it.)
@@ -1398,165 +1473,207 @@ def retrieve_facts(
         except Exception:
             augmented_prompt = prompt
 
-    # ── 2. Vector ranking ──────────────────────────────────────────────────
-    prompt_emb = embed_text(augmented_prompt)
+    # ── 2-X. Query decomposition ─────────────────────────────────────────
+    sub_queries = _decompose_query(prompt) if _USE_QUERY_DECOMPOSITION else [prompt]
+
     emb_by_fid: dict[int, list] = {fid: emb for fid, _c, emb, *_ in rows}
-    vec_scored = sorted(
-        ((cosine_similarity(prompt_emb, emb), fid) for fid, emb in emb_by_fid.items()),
-        reverse=True,
-    )
-    vec_rank: dict[int, int] = {fid: rank for rank, (_, fid) in enumerate(vec_scored)}
     content_by_fid: dict[int, str] = {fid: content for fid, content, *_ in rows}
-
-    # ── 3. BM25 via FTS5 ──────────────────────────────────────────────────
-    bm25_rank: dict[int, int] = {}
-    phrase_fids: set[int] = set()   # facts matching exact phrase — get 1.5× BM25 boost
-    fts_query = _fts5_query(prompt)
     candidate_ids = tuple(fid for fid, *_ in rows)
-    if fts_query:
-        placeholders = ",".join("?" for _ in candidate_ids)
-        try:
-            bm_cursor = conn.execute(
-                f"""SELECT rowid FROM facts_fts
-                    WHERE facts_fts MATCH ?
-                      AND rowid IN ({placeholders})
-                    ORDER BY bm25(facts_fts)""",
-                (fts_query, *candidate_ids),
-            )
-            for rank, (fid,) in enumerate(bm_cursor.fetchall()):
-                bm25_rank[fid] = rank
-        except sqlite3.OperationalError:
-            pass
+    n_facts = len(rows)
 
-        # Phrase boost: exact phrase match via FTS5 quoted syntax.
-        # Applies 1.5× weight to the BM25 component in RRF for phrase-matching facts.
-        prompt_words = prompt.strip().split()
-        if len(prompt_words) >= 2:
-            phrase_query = f'"{prompt.strip()}"'
+    # Multi-query ranking: accumulate max RRF per fact across all sub-queries.
+    # For single-query mode (sub_queries == [prompt]), this behaves identically
+    # to the original pipeline.
+    raw_rrf: dict[int, float] = {}
+    _broad_parts: list[int] = []
+    bm25_rank: dict[int, int] = {}
+    phrase_fids: set[int] = set()
+    derived_rank: dict[int, int] = {}
+    entity_rank: dict[int, int] = {}
+    context_rank: dict[int, int] = {}
+    vec_rank: dict[int, int] = {}
+
+    for sq in sub_queries:
+        augmented_sq = augmented_prompt.replace(prompt, sq, 1) if len(sub_queries) > 1 else augmented_prompt
+
+        # Vector ranking
+        sq_emb = embed_text(augmented_sq)
+        sq_vec_scored = sorted(
+            ((cosine_similarity(sq_emb, emb), fid) for fid, emb in emb_by_fid.items()),
+            reverse=True,
+        )
+        sq_vec_rank: dict[int, int] = {fid: rank for rank, (_, fid) in enumerate(sq_vec_scored)}
+
+        # BM25
+        sq_bm25_rank: dict[int, int] = {}
+        sq_phrase_fids: set[int] = set()
+        sq_fts = _fts5_query(sq)
+        if sq_fts:
+            placeholders = ",".join("?" for _ in candidate_ids)
             try:
-                ph_cursor = conn.execute(
+                bm_cursor = conn.execute(
                     f"""SELECT rowid FROM facts_fts
                         WHERE facts_fts MATCH ?
-                          AND rowid IN ({placeholders})""",
-                    (phrase_query, *candidate_ids),
+                          AND rowid IN ({placeholders})
+                        ORDER BY bm25(facts_fts)""",
+                    (sq_fts, *candidate_ids),
                 )
-                phrase_fids = {row[0] for row in ph_cursor.fetchall()}
+                for rank, (fid,) in enumerate(bm_cursor.fetchall()):
+                    sq_bm25_rank[fid] = rank
             except sqlite3.OperationalError:
                 pass
 
-    # ── 4. Derived BM25 via WordNet expansion (optional) ──────────────────
-    derived_rank: dict[int, int] = {}
-    if _USE_DERIVED_BM25 and fts_query:
-        try:
-            derived_q = _build_derived_text(prompt)
-            safe_d = "".join(c if c.isalnum() or c.isspace() else " " for c in derived_q)
-            dtokens = [t for t in safe_d.split() if len(t) > 2]
-            if dtokens:
-                dfts_q = " OR ".join(f'"{t}"' for t in dtokens)
-                dr_rows = conn.execute(
-                    "SELECT rowid FROM facts_derived_fts"
-                    " WHERE facts_derived_fts MATCH ? ORDER BY bm25(facts_derived_fts)",
-                    (dfts_q,),
-                ).fetchall()
-                dr_rank = 0
-                fids_set_d = set(candidate_ids)
-                for (dfid,) in dr_rows:
-                    if dfid in fids_set_d:
-                        derived_rank[dfid] = dr_rank
-                        dr_rank += 1
-        except Exception:
-            pass
-
-    # ── 5. Entity-overlap ranking ─────────────────────────────────────────
-    entity_rank: dict[int, int] = {}
-    if not _RETRIEVE_BENCHMARK:
-        try:
-            prompt_ents = set(e.lower() for e in _extract_entities(prompt))
-            if prompt_ents:
-                ent_scores = []
-                for fid, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json, _imp, _fsid in rows:
-                    try:
-                        fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
-                    except Exception:
-                        fact_ents = set()
-                    shared = prompt_ents & fact_ents
-                    n_shared = len(shared)
-                    ratio = n_shared / max(len(prompt_ents), len(fact_ents), 1)
-                    if n_shared >= 2 or ratio > 0.3:
-                        overlap = ratio
-                    else:
-                        overlap = 0.0
-                    ent_scores.append((overlap, fid))
-                ent_scores.sort(reverse=True)
-                entity_rank = {fid: rank for rank, (_, fid) in enumerate(ent_scores)}
-        except Exception:
-            pass
-
-    # ── 6. Conversation-context BM25 ──────────────────────────────────────
-    # For each fact, compute how well the adjacent window (fact ± N turns)
-    # matches the query. This captures multi-turn context that single-fact
-    # BM25 misses (e.g. a fact saying "We chose React" only makes sense
-    # alongside the previous turn asking "What frontend?").
-    context_rank: dict[int, int] = {}
-    if _USE_CONTEXT_BM25:
-        try:
-            _q_ctx_tokens = [
-                t for t in re.sub(r'[^a-z\s]', ' ', prompt.lower()).split()
-                if len(t) > 2 and t not in _BM25_STOPWORDS
-            ]
-            if _q_ctx_tokens:
-                # Build full content map for neighbor lookup (pool facts + any extras)
-                _ctx_content: dict[int, str] = {r[0]: r[1] for r in all_candidate_rows}
-                # If not all neighbor facts are in pool, load missing ones from DB
-                _pool_min = min(r[0] for r in all_candidate_rows)
-                _pool_max = max(r[0] for r in all_candidate_rows)
-                _missing_fids = set()
-                for _fid, *_ in rows:
-                    for _off in range(-_CONTEXT_WINDOW_SIZE, _CONTEXT_WINDOW_SIZE + 1):
-                        _nfid = _fid + _off
-                        if _pool_min <= _nfid <= _pool_max and _nfid not in _ctx_content:
-                            _missing_fids.add(_nfid)
-                if _missing_fids:
-                    _ph = ",".join("?" for _ in _missing_fids)
-                    try:
-                        for _mfid, _mcontent in conn.execute(
-                            f"SELECT id, content FROM facts WHERE id IN ({_ph}) "
-                            "AND superseded_at IS NULL",
-                            list(_missing_fids),
-                        ).fetchall():
-                            _ctx_content[_mfid] = _mcontent
-                    except Exception:
-                        pass
-                _ctx_scores: dict[int, int] = {}
-                for _fid, _content, *_ in rows:
-                    _window_parts = [_content]
-                    for _off in range(-_CONTEXT_WINDOW_SIZE, _CONTEXT_WINDOW_SIZE + 1):
-                        if _off == 0:
-                            continue
-                        _nc = _ctx_content.get(_fid + _off)
-                        if _nc:
-                            _window_parts.append(_nc)
-                    _window_text = " ".join(_window_parts).lower()
-                    _ctx_score = sum(
-                        1 for _t in _q_ctx_tokens if _t in _window_text
+            sq_words = sq.strip().split()
+            if len(sq_words) >= 2:
+                ph_q = f'"{sq.strip()}"'
+                try:
+                    ph_cursor = conn.execute(
+                        f"""SELECT rowid FROM facts_fts
+                            WHERE facts_fts MATCH ?
+                              AND rowid IN ({placeholders})""",
+                        (ph_q, *candidate_ids),
                     )
-                    if _ctx_score:
-                        _ctx_scores[_fid] = _ctx_score
-                if _ctx_scores:
-                    _ctx_ranked = sorted(_ctx_scores, key=_ctx_scores.__getitem__, reverse=True)
-                    context_rank = {fid: i for i, fid in enumerate(_ctx_ranked)}
-        except Exception:
-            pass
+                    sq_phrase_fids = {row[0] for row in ph_cursor.fetchall()}
+                except sqlite3.OperationalError:
+                    pass
 
-    # ── 7. Multi-signal broad pool (Phase 1) ──────────────────────────────
-    # Gather top-N from each signal into a union pool so facts strong in
-    # ANY one signal are visible to scoring. Tail (not in broad pool) is
-    # sorted by RRF and appended after.
-    n_facts = len(rows)
+        # Derived BM25
+        sq_derived_rank: dict[int, int] = {}
+        if _USE_DERIVED_BM25 and sq_fts:
+            try:
+                derived_q = _build_derived_text(sq)
+                safe_d = "".join(c if c.isalnum() or c.isspace() else " " for c in derived_q)
+                dtokens = [t for t in safe_d.split() if len(t) > 2]
+                if dtokens:
+                    dfts_q = " OR ".join(f'"{t}"' for t in dtokens)
+                    dr_rows = conn.execute(
+                        "SELECT rowid FROM facts_derived_fts"
+                        " WHERE facts_derived_fts MATCH ? ORDER BY bm25(facts_derived_fts)",
+                        (dfts_q,),
+                    ).fetchall()
+                    dr_r = 0
+                    fids_set_d = set(candidate_ids)
+                    for (dfid,) in dr_rows:
+                        if dfid in fids_set_d:
+                            sq_derived_rank[dfid] = dr_r
+                            dr_r += 1
+            except Exception:
+                pass
+
+        # Entity overlap
+        sq_entity_rank: dict[int, int] = {}
+        if not _RETRIEVE_BENCHMARK:
+            try:
+                prompt_ents = set(e.lower() for e in _extract_entities(sq))
+                if prompt_ents:
+                    ent_scores = []
+                    for fidi, _c, _e, _rc, _ca, _ft, _ef, _lra, _ivd, ents_json, _imp, _fsid in rows:
+                        try:
+                            fact_ents = set(e.lower() for e in json.loads(ents_json or "[]"))
+                        except Exception:
+                            fact_ents = set()
+                        shared = prompt_ents & fact_ents
+                        n_shared = len(shared)
+                        ratio = n_shared / max(len(prompt_ents), len(fact_ents), 1)
+                        if n_shared >= 2 or ratio > 0.3:
+                            overlap = ratio
+                        else:
+                            overlap = 0.0
+                        ent_scores.append((overlap, fidi))
+                    ent_scores.sort(reverse=True)
+                    sq_entity_rank = {fidi: rank for rank, (_, fidi) in enumerate(ent_scores)}
+            except Exception:
+                pass
+
+        # Context BM25
+        sq_context_rank: dict[int, int] = {}
+        if _USE_CONTEXT_BM25:
+            try:
+                _q_ctx_tokens = [
+                    t for t in re.sub(r'[^a-z\s]', ' ', sq.lower()).split()
+                    if len(t) > 2 and t not in _BM25_STOPWORDS
+                ]
+                if _q_ctx_tokens:
+                    _ctx_content: dict[int, str] = {r[0]: r[1] for r in all_candidate_rows}
+                    _pool_min = min(r[0] for r in all_candidate_rows)
+                    _pool_max = max(r[0] for r in all_candidate_rows)
+                    _missing_fids = set()
+                    for _fid, *_ in rows:
+                        for _off in range(-_CONTEXT_WINDOW_SIZE, _CONTEXT_WINDOW_SIZE + 1):
+                            _nfid = _fid + _off
+                            if _pool_min <= _nfid <= _pool_max and _nfid not in _ctx_content:
+                                _missing_fids.add(_nfid)
+                    if _missing_fids:
+                        _ph = ",".join("?" for _ in _missing_fids)
+                        try:
+                            for _mfid, _mcontent in conn.execute(
+                                f"SELECT id, content FROM facts WHERE id IN ({_ph}) "
+                                "AND superseded_at IS NULL",
+                                list(_missing_fids),
+                            ).fetchall():
+                                _ctx_content[_mfid] = _mcontent
+                        except Exception:
+                            pass
+                    _ctx_scores: dict[int, int] = {}
+                    for _fid, _content, *_ in rows:
+                        _window_parts = [_content]
+                        for _off in range(-_CONTEXT_WINDOW_SIZE, _CONTEXT_WINDOW_SIZE + 1):
+                            if _off == 0:
+                                continue
+                            _nc = _ctx_content.get(_fid + _off)
+                            if _nc:
+                                _window_parts.append(_nc)
+                        _window_text = " ".join(_window_parts).lower()
+                        _ctx_score = sum(1 for _t in _q_ctx_tokens if _t in _window_text)
+                        if _ctx_score:
+                            _ctx_scores[_fid] = _ctx_score
+                    if _ctx_scores:
+                        _ctx_ranked = sorted(_ctx_scores, key=_ctx_scores.__getitem__, reverse=True)
+                        sq_context_rank = {fid: i for i, fid in enumerate(_ctx_ranked)}
+            except Exception:
+                pass
+
+        # RRF for this sub-query — accumulate max per fact across sub-queries
+        for fid, *_ in rows:
+            s = 1.0 / (_RRF_K + sq_vec_rank.get(fid, n_facts))
+            if fid in sq_bm25_rank:
+                bm25_component = 1.0 / (_RRF_K + sq_bm25_rank[fid])
+                if fid in sq_phrase_fids:
+                    bm25_component *= 1.5
+                s += bm25_component
+            if _USE_DERIVED_BM25 and fid in sq_derived_rank:
+                s += 1.0 / (_RRF_K + sq_derived_rank[fid])
+            if _USE_CONTEXT_BM25 and fid in sq_context_rank:
+                s += 1.0 / (_RRF_K + sq_context_rank[fid])
+            if fid in sq_entity_rank:
+                s += 1.0 / (_RRF_K + sq_entity_rank[fid])
+            if fid not in raw_rrf or s > raw_rrf[fid]:
+                raw_rrf[fid] = s
+            # Track per-signal best ranks for broad pool (use first sub-query's ranks for simplicity)
+            if len(sub_queries) == 1:
+                vec_rank[fid] = sq_vec_rank.get(fid, n_facts)
+                if fid in sq_bm25_rank:
+                    bm25_rank[fid] = sq_bm25_rank[fid]
+                if fid in sq_phrase_fids:
+                    phrase_fids.add(fid)
+                if fid in sq_derived_rank:
+                    derived_rank[fid] = sq_derived_rank[fid]
+                if fid in sq_entity_rank:
+                    entity_rank[fid] = sq_entity_rank[fid]
+                if fid in sq_context_rank:
+                    context_rank[fid] = sq_context_rank[fid]
+
+    # For decomposed queries, rebuild per-signal ranks from merged RRF for broad pool
+    if len(sub_queries) > 1:
+        vec_rank = {fid: rank for rank, fid in enumerate(sorted(raw_rrf, key=raw_rrf.__getitem__, reverse=True))}
+
+    max_rrf = max(raw_rrf.values()) if raw_rrf else 1.0
+
+    # ── 7. Multi-signal broad pool ────────────────────────────────────────
     if _BROAD_POOL > 0:
         _cos_order = sorted((fid for fid, *_ in rows), key=lambda f: vec_rank.get(f, n_facts))
         _bm25_order = sorted((fid for fid, *_ in rows), key=lambda f: bm25_rank.get(f, n_facts))
-        _broad_parts: list[int] = _cos_order[:_BROAD_POOL] + _bm25_order[:_BROAD_POOL]
+        _broad_parts = list(_cos_order[:_BROAD_POOL]) + _bm25_order[:_BROAD_POOL]
         if _USE_DERIVED_BM25:
             _broad_parts += sorted(
                 (fid for fid, *_ in rows), key=lambda f: derived_rank.get(f, n_facts)
@@ -1565,7 +1682,6 @@ def retrieve_facts(
             _broad_parts += sorted(
                 (fid for fid, *_ in rows), key=lambda f: context_rank.get(f, n_facts)
             )[:_BROAD_POOL]
-        # Lexical explicit-memory channels (name/date/bigram)
         if _USE_LEXICAL_CHANNELS:
             import re as _re_lx
             _STOPNAME_LX = frozenset({
@@ -1574,7 +1690,6 @@ def retrieve_facts(
                 'Would', 'Could', 'Should', 'Which', 'Why', 'That', 'This',
                 'His', 'Her', 'Its', 'Our', 'Their', 'Then', 'Than', 'From',
             })
-            # Channel A: person-name
             _name_toks = [w for w in _re_lx.findall(r'\b[A-Z][a-z]{2,}\b', prompt)
                           if w not in _STOPNAME_LX]
             if _name_toks:
@@ -1584,7 +1699,6 @@ def retrieve_facts(
                     if _s:
                         _name_sc[_fid] = _s
                 _broad_parts += sorted(_name_sc, key=_name_sc.__getitem__, reverse=True)[:_BROAD_POOL]
-            # Channel B: date/year
             _MONTH_RE = r'(?:January|February|March|April|May|June|July|August|September|October|November|December)'
             _date_toks = list(dict.fromkeys(
                 _re_lx.findall(rf'\b{_MONTH_RE}\s+\d{{4}}\b|\b\d{{4}}\b', prompt)
@@ -1596,7 +1710,6 @@ def retrieve_facts(
                     if _s:
                         _date_sc[_fid] = _s
                 _broad_parts += sorted(_date_sc, key=_date_sc.__getitem__, reverse=True)[:_BROAD_POOL]
-            # Channel C: key-bigram
             _q_words_lx = [w for w in _re_lx.sub(r'[^a-z\s]', ' ', prompt.lower()).split()
                            if len(w) > 2 and w not in _BM25_STOPWORDS]
             if len(_q_words_lx) >= 2:
@@ -1621,43 +1734,18 @@ def retrieve_facts(
                         if any(_bg in _cl for _bg in _bigrams_lx):
                             _bgram_hits.append(_fid)
                 _broad_parts += _bgram_hits[:_BROAD_POOL]
-        # Deduplicate while preserving partial order
         _broad_cands = list(dict.fromkeys(_broad_parts))
         _broad_set = set(_broad_cands)
     else:
         _broad_cands = [fid for fid, *_ in rows]
         _broad_set = set(_broad_cands)
 
-    # ── 7. Three-way RRF fusion ────────────────────────────────────────────
-    n = len(rows)
-    raw_rrf: dict[int, float] = {}
-    for fid, *_ in rows:
-        s = 1.0 / (_RRF_K + vec_rank.get(fid, n))
-        if fid in bm25_rank:
-            bm25_component = 1.0 / (_RRF_K + bm25_rank[fid])
-            if fid in phrase_fids:
-                bm25_component *= 1.5   # phrase match boost — exact phrase in content
-            s += bm25_component
-        if _USE_DERIVED_BM25 and fid in derived_rank:
-            s += 1.0 / (_RRF_K + derived_rank[fid])
-        if _USE_CONTEXT_BM25 and fid in context_rank:
-            s += 1.0 / (_RRF_K + context_rank[fid])
-        if fid in entity_rank:
-            s += 1.0 / (_RRF_K + entity_rank[fid])
-        raw_rrf[fid] = s
-    max_rrf = max(raw_rrf.values()) if raw_rrf else 1.0
-
-    # Sort broad pool by RRF, append tail (facts not in broad pool) sorted by RRF
-    if _BROAD_POOL > 0:
-        _broad_sorted = sorted(_broad_cands, key=lambda f: raw_rrf.get(f, 0.0), reverse=True)
-        _tail_sorted = sorted(
-            (fid for fid, *_ in rows if fid not in _broad_set),
-            key=lambda f: raw_rrf.get(f, 0.0), reverse=True
-        )
-        _rerank_order = _broad_sorted + _tail_sorted
-    else:
-        _rerank_order = sorted(raw_rrf, key=raw_rrf.__getitem__, reverse=True)
-    # Snapshot pre-score order for coverage guard
+    _broad_sorted = sorted(_broad_cands, key=lambda f: raw_rrf.get(f, 0.0), reverse=True)
+    _tail_sorted = sorted(
+        (fid for fid, *_ in rows if fid not in _broad_set),
+        key=lambda f: raw_rrf.get(f, 0.0), reverse=True
+    )
+    _rerank_order = _broad_sorted + _tail_sorted
     _pre_score_order = list(_rerank_order) if _COVERAGE_K > 0 else None
 
     # ── 8. Combined score per fact ─────────────────────────────────────────
@@ -1776,8 +1864,10 @@ def retrieve_facts(
     _pre_ce_order = list(scored) if _CE_GUARD_K > 0 else None
     try:
         cross_enc = _get_cross_encoder()
-        if cross_enc is not None and len(scored) > 5:
+        if cross_enc is not None and len(scored) > 5 and _CE_POOL_SIZE > 0:
             ce_pool = scored[:_CE_POOL_SIZE]
+            if not ce_pool:
+                raise StopIteration  # skip CE — empty pool
             # BM25 anchor: guarantee top-5 BM25 facts enter the CE pool even if
             # composite scoring pushed them past the pool boundary.
             if bm25_rank:
@@ -1802,9 +1892,27 @@ def retrieve_facts(
                 return raw
 
             pairs = [(prompt, _curr_text(c)) for _, _, c, *_ in ce_pool]
-            t0 = time.time()
-            ce_raw = cross_enc.predict(pairs)
-            if time.time() - t0 < _CE_TIMEOUT:
+
+            # Run CE in a subprocess so it can be killed if it exceeds the timeout.
+            # Direct cross_enc.predict() hangs cannot be interrupted — the model
+            # call is in C (ONNX Runtime) and Python-level timeout doesn't help.
+            # Skip in benchmark mode and when pool is empty to avoid 5s subprocess
+            # fork overhead on every query.
+            _ce_queue: mp.Queue = mp.Queue()
+            _ce_proc = mp.Process(target=_ce_predict_worker, args=(pairs, _ce_queue))
+            _ce_proc.start()
+            _ce_proc.join(timeout=_CE_TIMEOUT)
+            ce_raw = None
+            if _ce_proc.is_alive():
+                _ce_proc.terminate()
+                _ce_proc.join()
+            else:
+                try:
+                    ce_raw = _ce_queue.get_nowait()
+                except Exception:
+                    pass
+
+            if ce_raw is not None:
                 ce_min = min(ce_raw)
                 ce_max = max(ce_raw)
                 ce_range = ce_max - ce_min if ce_max > ce_min else 1.0
@@ -1918,15 +2026,20 @@ def retrieve_facts(
         conn.close()
 
         seen_content: set[str] = set(results)
-        extra_cap = top_n + 3
         for fid in primary_ids:
-            if len(results) >= extra_cap:
+            if budget_hit or len(results) >= top_n + 3:
                 break
             for neighbour in get_related_facts(fid, depth=1):
-                if len(results) >= extra_cap:
+                if budget_hit or len(results) >= top_n + 3:
                     break
                 nc = neighbour["content"]
                 if nc not in seen_content:
+                    n_mult = 1.8 if neighbour.get("fact_type") == "snippet" else 1.3
+                    n_tokens = int(len(nc.split()) * n_mult)
+                    if token_sum + n_tokens > max_tokens:
+                        budget_hit = True
+                        break
+                    token_sum += n_tokens
                     seen_content.add(nc)
                     results.append(nc)
     else:
@@ -1984,8 +2097,7 @@ def consolidate_memories(
         "id, content, embedding, entities, retrieval_count, fact_type, session_id"
     )
     _WHERE = (
-        "project_id = ? AND superseded_at IS NULL "
-        "AND (valid_to IS NULL OR valid_to > unixepoch())"
+        "project_id = ? AND superseded_at IS NULL"
     )
     rows = conn.execute(
         f"SELECT {_COLS} FROM facts WHERE {_WHERE} ORDER BY id ASC",
@@ -2123,7 +2235,8 @@ def consolidate_memories(
 
     if merged_count > 0:
         conn.commit()
-        _CACHE_DIRTY.add(project_id)
+        with _CACHE_DIRTY_LOCK:
+            _CACHE_DIRTY.add(project_id)
     conn.close()
     return {
         "project_id": project_id,
