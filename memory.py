@@ -94,6 +94,60 @@ _IMPORTANCE_KEYWORDS: frozenset = frozenset({
     "breaking", "security", "auth", "production", "prod", "deprecated",
     "migration", "decided", "architectural",
 })
+
+# ── Query-type routing profiles ─────────────────────────────────────────────
+# Each profile specifies per-fact-type score multipliers for a query category.
+# Applied in the retrieval scoring loop — boosts relevant fact types for the
+# detected query intent without changing store-time importance weights.
+_QUERY_TYPE_PROFILES: dict[str, dict] = {
+    "single-session-user": {
+        "boost": {"turn": 3.0, "window": 2.0, "llm_atomic": 0.6,
+                  "preference": 0.5, "decision": 0.3, "finding": 0.3},
+    },
+    "single-session-preference": {
+        "boost": {"preference": 1.8, "turn": 1.5, "window": 1.3,
+                  "llm_atomic": 0.7, "decision": 0.4, "finding": 0.4},
+    },
+    "temporal-reasoning": {
+        "boost": {"window": 1.3, "turn": 1.4, "llm_atomic": 1.0,
+                  "preference": 0.7, "decision": 0.8, "finding": 0.8},
+    },
+    "knowledge-update": {
+        "boost": {"llm_atomic": 1.2, "window": 0.8, "turn": 0.9,
+                  "decision": 1.3, "finding": 1.2, "preference": 0.7},
+    },
+    "multi-session": {
+        "boost": {"llm_atomic": 1.1, "window": 0.9, "turn": 1.0,
+                  "decision": 1.0, "finding": 0.9, "preference": 0.7},
+    },
+}
+_QUERY_TYPE_CLASSIFIERS: dict[str, set[str]] = {
+    "single-session-user": {"i", "my", "me", "myself", "mine", "i'm", "i've", "i'd"},
+    "single-session-preference": {"prefer", "like", "want", "enjoy", "love", "hate",
+                                  "dislike", "favorite", "rather", "instead", "choice", "taste"},
+    "temporal-reasoning": {"before", "after", "when", "then", "first", "last", "ago",
+                           "later", "earlier", "during", "while", "until", "since",
+                           "previously", "recently", "originally", "initially"},
+    "knowledge-update": {"now", "currently", "recently", "new", "changed", "update",
+                         "latest", "today", "yesterday"},
+    "multi-session": {"and", "also", "both", "compare", "difference", "between",
+                      "across", "multiple", "sessions", "earlier", "previously"},
+}
+_TEMPORAL_WORDS: set[str] = _QUERY_TYPE_CLASSIFIERS["temporal-reasoning"]
+
+
+def _classify_query_type(query: str) -> str:
+    """Classify query into type for routing. Zero-LLM, deterministic."""
+    q = query.lower()
+    words = set(q.split())
+    best_type = "default"
+    best_score = 0
+    for qtype, keywords in _QUERY_TYPE_CLASSIFIERS.items():
+        score = len(words & keywords)
+        if score > best_score:
+            best_score = score
+            best_type = qtype
+    return best_type
 # Phase C: MMR lambdas — two separate values for pre-CE (candidate selection)
 # and post-CE (output deduplication). Pre-CE uses pure relevance (λ=1.0) so the
 # cross-encoder sees the highest-scoring candidates, not a diversity-adjusted set.
@@ -413,6 +467,48 @@ def _extract_svo_facts(window_content: str) -> list[str]:
             seen.add(key)
             deduped.append(f)
     return deduped
+
+
+# ── Preference extraction (zero-LLM, regex-based) ────────────────────────────
+
+_PREFERENCE_PATTERNS: list[tuple[str, str]] = [
+    # "I prefer tea" → preference: tea
+    (r'(?:i|we)\s+(?:prefer|like|enjoy|love|want|need|favor)\s+(?:to\s+)?(.+?)(?:\.|;|,|$)',
+     "preference: {m}"),
+    # "My favorite is tea" → preference: tea
+    (r'(?:my|our)\s+(?:favorite|preferred|choice|pick)\s+(?:is|are|would\s+be)\s+(.+?)(?:\.|;|,|$)',
+     "preference: {m}"),
+    # "I guess tea is fine" → preference: tea (implicit)
+    (r'(?:i\s+(?:guess|think|suppose)|maybe|probably)\s+(.+?)\s+(?:is\s+(?:fine|ok|good|better|alright)|works|sounds\s+good)',
+     "preference: {m}"),
+    # "Tea instead of coffee" → preference: tea
+    (r'(.+?)\s+(?:instead\s+of|rather\s+than)\s+(.+?)(?:\.|;|,|$)',
+     "preference: {m1} over {m2}"),
+    # "I'd rather have tea" → preference: tea
+    (r'(?:i|we)\s*(?:\'d|would)\s+rather\s+(?:have|get|use|do)\s+(.+?)(?:\.|;|,|$)',
+     "preference: {m}"),
+]
+
+
+def _extract_preferences(text: str) -> list[str]:
+    """Extract preference facts from text using regex patterns. Zero-LLM, ~0.1ms."""
+    prefs: list[str] = []
+    text_lower = text.lower()
+    for pattern, template in _PREFERENCE_PATTERNS:
+        for match in re.finditer(pattern, text_lower):
+            try:
+                if "{m1}" in template and "{m2}" in template:
+                    pref = template.format(m1=match.group(1).strip(), m2=match.group(2).strip())
+                else:
+                    pref = template.format(m=match.group(1).strip() if match.lastindex and match.lastindex >= 1 else match.group(0))
+                words = pref.split()
+                if 3 < len(words) < 25:
+                    prefs.append(pref)
+            except Exception:
+                continue
+    seen: set[str] = set()
+    return [p for p in prefs if not (p in seen or seen.add(p))]
+
 
 
 # ─── Database init ────────────────────────────────────────────────────────────
@@ -1290,6 +1386,13 @@ def store_turn_window(
         svo_facts = _extract_svo_facts(content)
         for svo in svo_facts:
             store_fact(project_id, session_id, svo, "note", enrich=True)
+    # Extract preference facts from current turn via regex patterns.
+    # Zero-LLM, ~0.1ms per turn — runs unconditionally.
+    if curr_line:
+        for pref in _extract_preferences(curr_line):
+            pref_emb = embed_text(pref)
+            store_fact(project_id, session_id, pref, "preference",
+                       enrich=False, _precomputed_emb=pref_emb)
     return window_fid
 
 
@@ -1750,6 +1853,30 @@ def retrieve_facts(
     _rerank_order = _broad_sorted + _tail_sorted
     _pre_score_order = list(_rerank_order) if _COVERAGE_K > 0 else None
 
+    # ── Query-type routing ────────────────────────────────────────────────
+    _query_type = _classify_query_type(prompt)
+    _is_temporal_query = any(w in prompt.lower() for w in _TEMPORAL_WORDS)
+    _temporal_direction = "default"
+    _ts_range = (0, 1)
+    if _is_temporal_query:
+        if any(w in prompt.lower() for w in {"before", "earlier", "first", "originally", "initially"}):
+            _temporal_direction = "before"
+        elif any(w in prompt.lower() for w in {"after", "later", "then", "recently", "now", "currently"}):
+            _temporal_direction = "after"
+        elif any(w in prompt.lower() for w in {"when", "during", "while", "until", "since", "what time", "date"}):
+            _temporal_direction = "when"
+        try:
+            _ts_row = conn.execute(
+                "SELECT MIN(created_at), MAX(created_at) FROM facts WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if _ts_row and _ts_row[0] is not None:
+                _min_ts = _parse_dt(_ts_row[0]).timestamp() if isinstance(_parse_dt(_ts_row[0]), datetime) else float(_ts_row[0])
+                _max_ts = _parse_dt(_ts_row[1]).timestamp() if isinstance(_parse_dt(_ts_row[1]), datetime) else float(_ts_row[1])
+                _ts_range = (_min_ts, _max_ts)
+        except Exception:
+            pass
+
     # ── 8. Combined score per fact ─────────────────────────────────────────
     if _RETRIEVE_BENCHMARK:
         # Benchmark mode: use pure RRF order as scores (no composite scoring).
@@ -1795,10 +1922,30 @@ def retrieve_facts(
                 score *= _WINDOW_DEMOTION
             # Speaker boost: if a speaker name appears in the question AND this is a turn
             # fact whose content starts with that speaker, boost by 1.3x.
+            # Token-level matching prevents false positives (e.g. "Alex" matching "Alicia").
             if ft == "turn" and ": " in content:
-                turn_speaker = content.split(":", 1)[0].strip()
-                if turn_speaker and turn_speaker.lower() in prompt.lower():
+                turn_speaker = content.split(":", 1)[0].strip().lower()
+                prompt_tokens = set(prompt.lower().split())
+                if turn_speaker and turn_speaker in prompt_tokens:
                     score *= 1.3
+            # Query-type routing: per-fact-type boost from classified query profile.
+            # Applied after window demotion so the boosts compose.
+            if _query_type != "default":
+                qboost = _QUERY_TYPE_PROFILES.get(_query_type, {}).get("boost", {}).get(ft, 1.0)
+                if qboost != 1.0:
+                    score *= qboost
+            # Temporal boost: for temporal queries, boost facts by chrono relevance.
+            if _is_temporal_query:
+                _ft_ts = ca_dt.timestamp() if isinstance(ca_dt, datetime) else ca
+                if isinstance(_ft_ts, (int, float)) and _ts_range[1] > _ts_range[0]:
+                    _age_ratio = (_ts_range[1] - _ft_ts) / (_ts_range[1] - _ts_range[0])
+                    if _temporal_direction == "before":
+                        score += 0.15 * _age_ratio
+                    elif _temporal_direction == "after":
+                        score += 0.15 * (1.0 - _age_ratio)
+                    elif _temporal_direction == "when":
+                        if re.search(r'\b\d{4}[-/]\d{2}[-/]\d{2}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]* \d{1,2}\b', content, re.I):
+                            score += 0.12
             scored_all.append((score, fid, content, ef, lra, rc))
 
         # Coverage guard: min-rank ensemble of score rank and pre-score (RRF) rank.
