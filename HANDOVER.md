@@ -1011,3 +1011,71 @@ The 5s/query overhead during early benchmark attempts was caused by the CE subpr
 
 - `/home/sheldon_antony/.config/opencode/memory.py` — all Phase 1 fixes
 - GitHub: https://github.com/SheldonAntony/engram (pending push)
+
+---
+
+## v19b — Bugs Found and Fixed During LongMemEval (2026-05-22)
+
+### Bug 1: `store_fact` — `conn` referenced before assignment
+- `_compact_old_mutations(conn)` called at line **847** before `conn = init_db()` at line **853**
+- Regression from Phase 1 refactoring (moved compaction check ahead of DB init)
+- **Fix**: moved `global _compacted_this_process` / compaction block to after `conn = init_db()`
+
+### Bug 2: `retrieve_facts` — `prompt_emb` never defined
+- MMR diversity section (line **1962**) referenced `prompt_emb` but the query embedding was only computed inside a cache-hit conditional block as `prompt_emb_raw` / `qvec`
+- **Fix**: hoisted `prompt_emb_raw = embed_text(prompt)` to function scope before the ANN/matrix blocks; MMR now uses `prompt_emb_raw`
+- Variable was lost during Phase 1 restructuring of the embedding cache path
+
+---
+
+## LongMemEval Results (2026-05-22)
+
+Benchmark on the [LongMemEval](https://arxiv.org/abs/2410.10813) dataset (session-level retrieval).
+
+### Oracle split (no filler sessions)
+| Metric | Score |
+|--------|-------|
+| R@1    | 1.000 |
+| R@3    | 1.000 |
+| MRR@5  | 1.000 |
+| Time   | 136s (0.3s/q) |
+
+All 6 question types hit perfect recall. Oracle split has no filler sessions, so every haystack session is a ground-truth answer — confirms retrieval pipeline works correctly with no noise.
+
+### S split (~40 filler sessions per query)
+| Metric | Score |
+|--------|-------|
+| R@1    | 0.764 |
+| R@3    | 0.777 |
+| MRR@5  | 0.784 |
+| Time   | 39835s (~11h, 84.8s/q) |
+
+| Question type | N | R@1 | R@3 | MRR |
+|---|---|---|---|---|
+| knowledge-update | 72 | 0.833 | 0.833 | 0.854 |
+| multi-session | 121 | 0.818 | 0.826 | 0.839 |
+| single-session-assistant | 56 | 1.000 | 1.000 | 1.000 |
+| single-session-preference | 30 | 0.567 | 0.667 | 0.625 |
+| single-session-user | 64 | 0.562 | 0.562 | 0.576 |
+| temporal-reasoning | 127 | 0.717 | 0.732 | 0.739 |
+
+**Analysis:**
+- `single-session-assistant` (queries about what assistant said) scores 1.000 — excellent
+- `knowledge-update` and `multi-session` score 0.82-0.85 — good
+- `single-session-user` and `single-session-preference` score 0.56-0.57 — weak. These are queries about user statements or preferences mixed in with 40 filler sessions. The ANN search finds similar user queries from filler sessions instead of the exact target session.
+- `temporal-reasoning` at 0.717 — moderate. Needs temporal graph boost.
+
+**Notable:** 84.8s/q is dominated by DB indexing (40+ sessions × store_fact per query). Actual retrieval is ~0.3s/q (oracle). Per-query latency is misleading — real-world use indexes once, retrieves many times.
+
+### M split (~500 filler sessions)
+Started at 2026-05-22 (in background). Expected duration: ~5-7 days based on s split scaling.
+
+### Published baselines (paper, oracle split only)
+| Method | R@1 | MRR |
+|--------|-----|-----|
+| flat-BM25 | ~0.52 | ~0.57 |
+| flat-Contriever | ~0.60 | ~0.65 |
+| flat-GTE-Qwen2-7B | ~0.78 | ~0.82 |
+| **Preflight (ours)** | **1.000** | **1.000** |
+
+Note: Published baselines are oracle split only — no s or m split baselines available in the paper. Preflight's oracle score is expected since no filler = exact match to ground-truth sessions.

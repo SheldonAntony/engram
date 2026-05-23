@@ -841,16 +841,16 @@ def store_fact(project_id: str, session_id: str, text: str,
     to share a single embedding between the turn row and the window row (both embed
     the same curr_line text), halving the number of model inference calls.
     """
-    global _compacted_this_process
-    with _COMPACTED_LOCK:
-        if not _compacted_this_process:
-            _compact_old_mutations(conn)
-            _compacted_this_process = True
     if _precomputed_emb is not None:
         emb = _precomputed_emb
     else:
         emb = embed_text(_embed_text if _embed_text is not None else text)
     conn = init_db()
+    global _compacted_this_process
+    with _COMPACTED_LOCK:
+        if not _compacted_this_process:
+            _compact_old_mutations(conn)
+            _compacted_this_process = True
 
     # Find the most-similar live fact in this project (last 200).
     # Window facts are intentionally overlapping (sharing 2 of 3 turns) so
@@ -1331,6 +1331,9 @@ def retrieve_facts(
         "project_id = ? AND superseded_at IS NULL"
     )
 
+    # Compute query embedding early — used by ANN pool and later by MMR.
+    prompt_emb_raw = embed_text(prompt)
+
     # ── Pool A: ANN via in-process embedding cache ────────────────────────
     # Cache stores (fid_list, emb_matrix) per project. Rebuilt when dirty.
     pool_a: list = []
@@ -1374,7 +1377,6 @@ def retrieve_facts(
         if cached_mat is not None and len(cached_fids) > 0:
             # Embed the bare prompt for ANN pool selection.
             # (augmented_prompt is built later after pool; vector ranking step uses it.)
-            prompt_emb_raw = embed_text(prompt)
             qvec = np.array(prompt_emb_raw, dtype=np.float32)
             qnorm = np.linalg.norm(qvec)
             if qnorm > 0:
@@ -1959,7 +1961,7 @@ def retrieve_facts(
                 cand_emb = emb_by_fid.get(row[1])
                 if cand_emb is None:
                     continue
-                rel = cosine_similarity(prompt_emb, cand_emb)
+                rel = cosine_similarity(prompt_emb_raw, cand_emb)
                 redundancy = max(
                     (cosine_similarity(cand_emb, s) for s in selected_embs),
                     default=0.0,
