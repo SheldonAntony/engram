@@ -26,6 +26,8 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 from datetime import datetime, timezone
 
@@ -178,13 +180,32 @@ _SM2_GATE_ENABLED = True
 _POOL_A_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_A", "99999")) # ANN pool cap (default: all facts)
 _POOL_B_LIMIT          = int(os.environ.get("PREFLIGHT_POOL_B", "300"))   # proven-useful pool
 _RRF_K                 = int(os.environ.get("PREFLIGHT_RRF_K", "15"))     # RRF smoothing (15=tight, 60=loose)
+_RRF_SIGNAL_WEIGHTS    = os.environ.get("PREFLIGHT_RRF_WEIGHTS", "")      # per-signal RRF weights: "vec=1.0,bm25=1.2,entity=0.8"
+                                                                           # empty = equal weights (original behavior)
+
+# Per-signal RRF weight dict (parsed from env var at module load time).
+_RRF_W: dict[str, float] = {}
+if _RRF_SIGNAL_WEIGHTS:
+    for _pair in _RRF_SIGNAL_WEIGHTS.split(","):
+        if "=" in _pair:
+            _k, _v = _pair.split("=", 1)
+            _RRF_W[_k.strip()] = float(_v.strip())
+
+# HyDE query expansion — uses Qwen2.5-1.5b (via Ollama) when available.
+# Generates a hypothetical answer passage, embeds it, and interpolates with query embedding.
+# Env-gated: PREFLIGHT_USE_QUERY_EXPANSION=1
+_USE_QUERY_EXPANSION = os.environ.get("PREFLIGHT_USE_QUERY_EXPANSION", "0") == "1"
+_QUERY_EXPANSION_INTERPOLATION = float(os.environ.get("PREFLIGHT_QUERY_EXP_INTERP", "0.6"))  # query weight in interpolation
+
+_OLLAMA_URL = "http://localhost:11434/api/chat"
+_OLLAMA_MODEL = "qwen2.5:1.5b"
 _BROAD_POOL            = int(os.environ.get("PREFLIGHT_BROAD_POOL", "200")) # union top-N from each signal
 _USE_DERIVED_BM25      = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
 _USE_LEXICAL_CHANNELS  = os.environ.get("PREFLIGHT_USE_LEXICAL_CHANNELS", "0") == "1"
 _USE_CONTEXT_BM25      = os.environ.get("PREFLIGHT_USE_CONTEXT_BM25", "0") == "1"
 _USE_QUERY_DECOMPOSITION = os.environ.get("PREFLIGHT_USE_QUERY_DECOMPOSITION", "0") == "1"
 _CONTEXT_WINDOW_SIZE   = int(os.environ.get("PREFLIGHT_CONTEXT_WINDOW", "3"))
-_CE_POOL_SIZE          = int(os.environ.get("PREFLIGHT_CE_POOL", "120"))   # candidates fed to CE (benchmark: 200)
+_CE_POOL_SIZE          = int(os.environ.get("PREFLIGHT_CE_POOL", "160"))   # candidates fed to CE (benchmark: 200, up from 120)
 _CE_TIMEOUT            = float(os.environ.get("PREFLIGHT_CE_TIMEOUT", "5.0")) # max seconds for CE (bigger model needs more)
 _CE_GUARD_K            = int(os.environ.get("PREFLIGHT_CE_GUARD_K", "40")) # min-rank guard after CE (0=disabled)
 _COVERAGE_K            = int(os.environ.get("PREFLIGHT_COVERAGE_K", "40")) # min-rank after scoring (0=disabled)
@@ -195,10 +216,21 @@ _SESSION_MAX_LOOKBACK  = 7      # sessions back before score → 0.0
 _ENRICHMENT_MAX_TOKENS = 500    # max combined tokens before enrichment falls back to insert
 _ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact before enriching
 
-# Benchmark mode: used by recall_ablation.py to test production retrieval against LoCoMo.
-# When enabled, retrieve_facts() skips pool caps, composite scoring, SM-2 updates,
-# MMR, graph expansion, and returns (facts_list, fids_list) instead of just facts_list.
-_RETRIEVE_BENCHMARK = os.environ.get("PREFLIGHT_RETRIEVE_BENCHMARK", "0") == "1"
+# Benchmark mode: set to True to skip composite scoring, SM-2, MMR, graph expansion.
+# recall_ablation.py sets this directly after import if needed.
+# Default False = full production path with all scoring signals.
+_RETRIEVE_BENCHMARK = False
+
+# Composite scoring weights — sum to 1.0. RRF is the dominant signal (0.60).
+# Recency/staleness/session_rec/freq provide metadata context.
+# When sessions are sparse (< 3 entries), session_rec weight shifts to RRF adaptively.
+# All overridable via env vars for tuning.
+_W_COMP_RRF        = float(os.environ.get("PREFLIGHT_W_RRF", "0.60"))
+_W_COMP_RECENCY    = float(os.environ.get("PREFLIGHT_W_RECENCY", "0.12"))
+_W_COMP_STALENESS  = float(os.environ.get("PREFLIGHT_W_STALENESS", "0.08"))
+_W_COMP_SESSION_REC = float(os.environ.get("PREFLIGHT_W_SESSION_REC", "0.12"))
+_W_COMP_FREQ       = float(os.environ.get("PREFLIGHT_W_FREQ", "0.08"))
+_W_ADAPTIVE_SESSION_MIN = 3  # if fewer sessions than this, merge session_rec weight into RRF
 
 # Step 7: Retrospective ENRICH (consolidate_memories) tuning constants.
 _RETRO_FLOOR  = 0.35   # minimum pairwise cosine to trigger a merge
@@ -1396,6 +1428,45 @@ def store_turn_window(
     return window_fid
 
 
+# ── HyDE query expansion ────────────────────────────────────────────────────
+# Generates a hypothetical answer passage using Qwen2.5-1.5b (via Ollama),
+# then interpolates its embedding with the original query embedding.
+# Improves retrieval for short / underspecified queries.
+# Silently falls back to the raw query when Ollama is unavailable.
+
+_HYDE_SYSTEM_PROMPT = """\
+You are a helpful assistant. Given a question, write a brief, factual paragraph
+that answers it in a conversational style. Include specific names, dates, and
+details that would naturally appear in a memory of a past conversation.
+Do NOT make up facts — write what a reasonable answer might contain.
+Keep it under 50 words. Output ONLY the paragraph, no explanation."""
+
+def _expand_query_hyde(query: str, timeout_s: float = 5.0) -> str | None:
+    """Generate a hypothetical answer passage for the given query.
+    
+    Returns the HyDE text string, or None if Ollama is unavailable / times out.
+    """
+    payload = json.dumps({
+        "model": _OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": _HYDE_SYSTEM_PROMPT},
+            {"role": "user", "content": query},
+        ],
+        "stream": False,
+        "options": {"num_predict": 128},
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            _OLLAMA_URL, data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("message", {}).get("content", "").strip() or None
+    except Exception:
+        return None
+
+
 def retrieve_facts(
     project_id: str,
     session_id: str,
@@ -1603,6 +1674,17 @@ def retrieve_facts(
 
         # Vector ranking
         sq_emb = embed_text(augmented_sq)
+        # HyDE query expansion: generate hypothetical answer and interpolate embeddings.
+        # Improves recall for short / underspecified queries by bridging the vocabulary gap.
+        if _USE_QUERY_EXPANSION:
+            _hyde_text = _expand_query_hyde(sq, timeout_s=3.0)
+            if _hyde_text:
+                _hyde_emb = embed_text(_hyde_text)
+                _alpha = _QUERY_EXPANSION_INTERPOLATION
+                sq_emb = [
+                    _alpha * a + (1.0 - _alpha) * b
+                    for a, b in zip(sq_emb, _hyde_emb)
+                ]
         sq_vec_scored = sorted(
             ((cosine_similarity(sq_emb, emb), fid) for fid, emb in emb_by_fid.items()),
             reverse=True,
@@ -1739,19 +1821,24 @@ def retrieve_facts(
                 pass
 
         # RRF for this sub-query — accumulate max per fact across sub-queries
+        _w_vec     = _RRF_W.get("vec", 1.0)
+        _w_bm25    = _RRF_W.get("bm25", 1.0)
+        _w_entity  = _RRF_W.get("entity", 1.0)
+        _w_derived = _RRF_W.get("derived", 1.0)
+        _w_context = _RRF_W.get("context", 1.0)
         for fid, *_ in rows:
-            s = 1.0 / (_RRF_K + sq_vec_rank.get(fid, n_facts))
+            s = _w_vec * (1.0 / (_RRF_K + sq_vec_rank.get(fid, n_facts)))
             if fid in sq_bm25_rank:
                 bm25_component = 1.0 / (_RRF_K + sq_bm25_rank[fid])
                 if fid in sq_phrase_fids:
                     bm25_component *= 1.5
-                s += bm25_component
+                s += _w_bm25 * bm25_component
             if _USE_DERIVED_BM25 and fid in sq_derived_rank:
-                s += 1.0 / (_RRF_K + sq_derived_rank[fid])
+                s += _w_derived * (1.0 / (_RRF_K + sq_derived_rank[fid]))
             if _USE_CONTEXT_BM25 and fid in sq_context_rank:
-                s += 1.0 / (_RRF_K + sq_context_rank[fid])
+                s += _w_context * (1.0 / (_RRF_K + sq_context_rank[fid]))
             if fid in sq_entity_rank:
-                s += 1.0 / (_RRF_K + sq_entity_rank[fid])
+                s += _w_entity * (1.0 / (_RRF_K + sq_entity_rank[fid]))
             if fid not in raw_rrf or s > raw_rrf[fid]:
                 raw_rrf[fid] = s
             # Track per-signal best ranks for broad pool (use first sub-query's ranks for simplicity)
@@ -1915,8 +2002,14 @@ def retrieve_facts(
             freq = (rc / max_rc) if max_rc > 0 else 0.0
             staleness = min((now_ts - lra) / (30 * 86400), 1.0) if lra is not None else 1.0
             session_rec = _session_recency_score(fsid, session_id, session_idx_map)
-            # Weights sum to 1.0.
-            score = 0.35 * rrf + 0.20 * recency + 0.20 * staleness + 0.15 * session_rec + 0.10 * freq
+            # Adaptive weights: when sessions are sparse (< _W_ADAPTIVE_SESSION_MIN),
+            # shift session_rec weight to RRF (no session signal to use).
+            _w_rrf_use = _W_COMP_RRF
+            _w_session_use = _W_COMP_SESSION_REC
+            if len(session_idx_map) < _W_ADAPTIVE_SESSION_MIN:
+                _w_session_use = 0.0
+                _w_rrf_use = _W_COMP_RRF + _W_COMP_SESSION_REC
+            score = _w_rrf_use * rrf + _W_COMP_RECENCY * recency + _W_COMP_STALENESS * staleness + _w_session_use * session_rec + _W_COMP_FREQ * freq
             # Window demotion (adjustable via PREFLIGHT_WINDOW_DEMOTION, default 1.0 = no demotion).
             if ft == "window":
                 score *= _WINDOW_DEMOTION
@@ -2200,11 +2293,10 @@ def retrieve_facts(
             "budget_hit": budget_hit,
             "retrieved_count": len(results),
             "total_candidates": total_candidates,
+            "fids": primary_ids,
+            "all_ranked_fids": [r[1] for r in scored],
+            "all_ranked_scores": [r[0] for r in scored],
         }
-        if _RETRIEVE_BENCHMARK:
-            ret["fids"] = primary_ids
-            ret["all_ranked_fids"] = [r[1] for r in scored]
-            ret["all_ranked_scores"] = [r[0] for r in scored]
         if _gold_fid is not None:
             _gold_ids = [fid for fid in primary_ids]
             _stages["final_pos"] = _gold_ids.index(_gold_fid) if _gold_fid in _gold_ids else -1
