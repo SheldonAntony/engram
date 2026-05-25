@@ -89,8 +89,12 @@ _cross_encoder_tried = False
 _cross_encoder_model_name: str = ""
 
 _CE_MODEL_NAME = os.environ.get(
-    "PREFLIGHT_CE_MODEL", "BAAI/bge-reranker-v2-m3"
+    "PREFLIGHT_CE_MODEL", "mixedbread-ai/mxbai-rerank-xsmall-v1"
 )
+# Better CE models (set via PREFLIGHT_CE_MODEL):
+#   mixedbread-ai/mxbai-rerank-base-v1  (~200M, +3 BEIR over xsmall)
+#   BAAI/bge-reranker-v2-base           (~290M, good for technical queries)
+#   mixedbread-ai/mxbai-rerank-large-v1 (~1.5B, +5 BEIR, 5-10x slower)
 
 
 def get_cross_encoder():

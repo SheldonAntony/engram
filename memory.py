@@ -18,6 +18,7 @@ CLI usage:
 
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import os
 import re
@@ -1011,7 +1012,17 @@ def store_fact(project_id: str, session_id: str, text: str,
     # Window rows store blended 3-turn text; entity overlap signal is noisy.
     # Turn rows are identical speaker:text — entities are subset of window row.
     # fact_type='note'/'finding'/'decision' etc. still get full entity extraction.
-    entities = [] if fact_type in ("window", "turn", "llm_atomic") else _extract_entities(text)
+    # Extract entities: spaCy NER for note/finding/decision types.
+    # For window/turn rows, use fast regex (capitalized words) to catch speaker names.
+    if fact_type in ("window", "turn"):
+        _cap_words = list(dict.fromkeys(
+            w for w in re.findall(r'\b[A-Z][a-z]{2,}\b', text) if w
+        ))
+        entities = _cap_words
+    elif fact_type == "llm_atomic":
+        entities = []
+    else:
+        entities = _extract_entities(text)
     ents_json = json.dumps(entities)
     emb_blob = _encode_embedding(emb)
     # Phase A: importance scoring
@@ -1522,11 +1533,30 @@ def retrieve_facts(
                 ).fetchall()
                 cache_fids: list[int] = []
                 cache_vecs: list = []
+                _stored_dim: int | None = None
                 for cfid, cemb_blob in cache_rows:
                     vec = _decode_embedding(cemb_blob)
                     if vec is not None:
+                        if _stored_dim is None:
+                            _stored_dim = len(vec)
                         cache_fids.append(cfid)
                         cache_vecs.append(vec)
+                # Detect embedding model dimension change.
+                # If stored vectors don't match current model output dim,
+                # re-embed all facts silently (one-time migration cost).
+                if cache_vecs and len(prompt_emb_raw) != _stored_dim:
+                    _reembed_texts = conn.execute(
+                        "SELECT id, content FROM facts WHERE project_id = ? "
+                        "AND superseded_at IS NULL",
+                        (project_id,),
+                    ).fetchall()
+                    _new_vecs = embed_texts_batch([t for _, t in _reembed_texts])
+                    cache_fids = [rid for rid, _ in _reembed_texts]
+                    cache_vecs = list(_new_vecs)
+                    _update_sql = "UPDATE facts SET embedding = ? WHERE id = ?"
+                    for _fid, _vec in zip(cache_fids, cache_vecs):
+                        conn.execute(_update_sql, (_encode_embedding(_vec), _fid))
+                    conn.commit()
                 if cache_vecs:
                     mat = np.array(cache_vecs, dtype=np.float32)
                     # Normalise rows so dot product == cosine similarity.
@@ -1997,8 +2027,10 @@ def retrieve_facts(
             except Exception:
                 ca_dt = now
             days = max(0, (now - ca_dt).days)
-            decay = _DECAY_RATES.get(ft, _DECAY_RATES["note"])
-            recency = 1.0 / (1.0 + decay * days) if decay > 0 else 1.0
+            # FSRS-style retrievability decay: stability = f(retrieval_count, easiness_factor).
+            # Higher stability -> slower decay. Facts with 0 retrievals get stability=1.0 (fast decay).
+            _stability = max(1.0, (rc + 1) * ef) if ef is not None else max(1.0, rc + 1)
+            recency = math.exp(-days / _stability) if days > 0 else 1.0
             freq = (rc / max_rc) if max_rc > 0 else 0.0
             staleness = min((now_ts - lra) / (30 * 86400), 1.0) if lra is not None else 1.0
             session_rec = _session_recency_score(fsid, session_id, session_idx_map)
