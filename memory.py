@@ -153,19 +153,19 @@ _RRF_CONFIGS: dict[str, dict] = {
         "chrono": False,
     },
     "single-session-user": {
-        "k": 30,
+        "k": 15,
         "ann_weight": 1.0,
-        "bm25_weight": 1.3,
+        "bm25_weight": 1.0,
         "derived_weight": 1.0,
         "context_weight": 1.0,
         "entity_weight": 1.0,
-        "speaker_boost": True,
+        "speaker_boost": False,
         "chrono": False,
     },
     "single-session-preference": {
-        "k": 20,
+        "k": 15,
         "ann_weight": 1.0,
-        "bm25_weight": 1.2,
+        "bm25_weight": 1.0,
         "derived_weight": 1.0,
         "context_weight": 1.0,
         "entity_weight": 1.0,
@@ -1680,6 +1680,7 @@ def retrieve_facts(
     )
     _WHERE = (
         "project_id = ? AND superseded_at IS NULL"
+        + ("" if not _RETRIEVE_BENCHMARK else " AND fact_type != 'turn'")
     )
 
     # Compute query embedding early — used by ANN pool and later by MMR.
@@ -1694,7 +1695,8 @@ def retrieve_facts(
                 # Load all live fact IDs + embeddings for this project.
                 cache_rows = conn.execute(
                     "SELECT id, embedding FROM facts WHERE project_id = ? "
-                    "AND superseded_at IS NULL",
+                    "AND superseded_at IS NULL"
+                    + ("" if not _RETRIEVE_BENCHMARK else " AND fact_type != 'turn'"),
                     (project_id,),
                 ).fetchall()
                 cache_fids: list[int] = []
@@ -2205,6 +2207,7 @@ def retrieve_facts(
             (raw_rrf.get(fid, 0.0), fid, content_by_fid[fid], 2.5, None, 0)
             for fid in _rerank_order
         ]
+        scored_all.sort(key=lambda x: x[0], reverse=True)
     else:
         # Preload session indices for session_recency scoring (one DB read, not per-fact).
         session_idx_map: dict[str, int] = {}
