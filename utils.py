@@ -27,11 +27,13 @@ def get_embedding_model():
     if _embedding_model is None:
         if _EMBED_BACKEND == "sentence-transformers":
             from sentence_transformers import SentenceTransformer  # lazy
-            model_name = _EMBED_MODEL or "BAAI/bge-small-en-v1.5"
+            model_name = _EMBED_MODEL or "BAAI/bge-base-en-v1.5"
             _embedding_model = SentenceTransformer(model_name)
         else:
             from fastembed import TextEmbedding  # lazy: only loaded when embeddings are needed
-            _embedding_model = TextEmbedding(_EMBED_MODEL) if _EMBED_MODEL else TextEmbedding()
+            _embedding_model = TextEmbedding(
+                _EMBED_MODEL or "BAAI/bge-base-en-v1.5"
+            ) if not _EMBED_MODEL else TextEmbedding(_EMBED_MODEL)
     return _embedding_model
 
 

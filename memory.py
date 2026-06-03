@@ -30,7 +30,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import numpy as np
@@ -44,7 +44,7 @@ from utils import cosine_similarity, embed_text, embed_texts_batch
 # LLM atomic fact extractor (Qwen2.5-1.5B via Ollama) — opt-in via env flag.
 # Requires: ollama pull qwen2.5:1.5b  and Ollama running on localhost:11434.
 # Silently no-ops when Ollama is not available; raw storage is never affected.
-_USE_LLM_EXTRACTOR = os.environ.get("PREFLIGHT_USE_LLM_EXTRACTOR", "0") == "1"
+_USE_LLM_EXTRACTOR = os.environ.get("PREFLIGHT_USE_LLM_EXTRACTOR", "1") == "1"
 
 try:
     from extractor import extract_entities as _extract_entities
@@ -138,6 +138,72 @@ _QUERY_TYPE_CLASSIFIERS: dict[str, set[str]] = {
 }
 _TEMPORAL_WORDS: set[str] = _QUERY_TYPE_CLASSIFIERS["temporal-reasoning"]
 
+# Query-type RRF profiles — per-type signal weights, RRF K, speaker boost, chrono sort.
+# Applied in the RRF computation loop; overrides _RRF_W for the matched query type.
+# "default" profile is used when no classifier matches (or as fallback).
+_RRF_CONFIGS: dict[str, dict] = {
+    "default": {
+        "k": 15,
+        "ann_weight": 1.0,
+        "bm25_weight": 1.0,
+        "derived_weight": 1.0,
+        "context_weight": 1.0,
+        "entity_weight": 1.0,
+        "speaker_boost": False,
+        "chrono": False,
+    },
+    "single-session-user": {
+        "k": 30,
+        "ann_weight": 1.0,
+        "bm25_weight": 1.3,
+        "derived_weight": 1.0,
+        "context_weight": 1.0,
+        "entity_weight": 1.0,
+        "speaker_boost": True,
+        "chrono": False,
+    },
+    "single-session-preference": {
+        "k": 20,
+        "ann_weight": 1.0,
+        "bm25_weight": 1.2,
+        "derived_weight": 1.0,
+        "context_weight": 1.0,
+        "entity_weight": 1.0,
+        "speaker_boost": False,
+        "chrono": False,
+    },
+    "temporal-reasoning": {
+        "k": 15,
+        "ann_weight": 1.0,
+        "bm25_weight": 1.0,
+        "derived_weight": 1.0,
+        "context_weight": 1.5,
+        "entity_weight": 1.0,
+        "speaker_boost": False,
+        "chrono": True,
+    },
+    "knowledge-update": {
+        "k": 15,
+        "ann_weight": 1.0,
+        "bm25_weight": 1.0,
+        "derived_weight": 1.0,
+        "context_weight": 1.0,
+        "entity_weight": 1.0,
+        "speaker_boost": False,
+        "chrono": False,
+    },
+    "multi-session": {
+        "k": 15,
+        "ann_weight": 1.0,
+        "bm25_weight": 1.0,
+        "derived_weight": 1.0,
+        "context_weight": 1.0,
+        "entity_weight": 1.0,
+        "speaker_boost": False,
+        "chrono": False,
+    },
+}
+
 
 def _classify_query_type(query: str) -> str:
     """Classify query into type for routing. Zero-LLM, deterministic."""
@@ -151,6 +217,53 @@ def _classify_query_type(query: str) -> str:
             best_score = score
             best_type = qtype
     return best_type
+
+
+def _expand_temporal_query(query: str) -> dict:
+    """Lightweight temporal query expansion. Returns filter and sort directives."""
+    import re as _re_te
+    result = {"filter": None, "chrono": False, "sort": None}
+    q = query.lower()
+
+    if any(w in q for w in {"before", "earlier", "first", "originally", "initially", "previously"}):
+        result["chrono"] = True
+        result["sort"] = "created_at ASC"
+        years = _re_te.findall(r'\b(19|20)\d{2}\b', query)
+        if years:
+            result["filter"] = f"created_at < '{years[0]}-12-31'"
+
+    elif any(w in q for w in {"after", "later", "then", "recently", "now", "currently", "next"}):
+        result["chrono"] = True
+        result["sort"] = "created_at DESC"
+        if "recently" in q or "lately" in q:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+            result["filter"] = f"created_at > '{cutoff.isoformat()}'"
+
+    elif any(w in q for w in {"when", "during", "while", "until", "since", "what time", "date"}):
+        result["chrono"] = True
+        result["sort"] = "created_at DESC"
+
+    return result
+
+
+def _extract_temporal_metadata(text: str) -> dict:
+    """Extract dates and temporal references from fact text."""
+    import re as _re_et
+    metadata = {"years": [], "months": [], "dates": [], "relative": None}
+    metadata["years"] = _re_et.findall(r'\b(19|20)\d{2}\b', text)
+    metadata["dates"] = _re_et.findall(r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b', text)
+    relative_patterns = [
+        r'\b(last|next|this)\s+(week|month|year)\b',
+        r'\b(\d+)\s+(days?|weeks?|months?)\s+ago\b',
+    ]
+    for pattern in relative_patterns:
+        matches = _re_et.findall(pattern, text, re.I)
+        if matches:
+            metadata["relative"] = matches[0]
+            break
+    return metadata
+
+
 # Phase C: MMR lambdas — two separate values for pre-CE (candidate selection)
 # and post-CE (output deduplication). Pre-CE uses pure relevance (λ=1.0) so the
 # cross-encoder sees the highest-scoring candidates, not a diversity-adjusted set.
@@ -162,7 +275,7 @@ _MMR_LAMBDA_POST_CE = 0.25 # post-CE output: light diversity deduplication
 # Step 6: window demotion factor — applied to composite score for fact_type="window".
 # Keeps windows retrievable as fallback while atomic SVO facts rank above them.
 # Set to 1.0 to disable demotion entirely (recommended: window facts carry useful context).
-_WINDOW_DEMOTION = float(os.environ.get("PREFLIGHT_WINDOW_DEMOTION", "1.0"))
+_WINDOW_DEMOTION = float(os.environ.get("PREFLIGHT_WINDOW_DEMOTION", "0.7"))
 
 # SM-2 gate: when False, SM-2 interval check is skipped for candidate selection.
 # EF/interval updates still happen on retrieval — they feed the staleness score.
@@ -197,17 +310,18 @@ if _RRF_SIGNAL_WEIGHTS:
 # Env-gated: PREFLIGHT_USE_QUERY_EXPANSION=1
 _USE_QUERY_EXPANSION = os.environ.get("PREFLIGHT_USE_QUERY_EXPANSION", "0") == "1"
 _QUERY_EXPANSION_INTERPOLATION = float(os.environ.get("PREFLIGHT_QUERY_EXP_INTERP", "0.6"))  # query weight in interpolation
+_SYNC_EXTRACT = os.environ.get("PREFLIGHT_SYNC_EXTRACT", "0") == "1"
 
 _OLLAMA_URL = "http://localhost:11434/api/chat"
 _OLLAMA_MODEL = "qwen2.5:1.5b"
 _BROAD_POOL            = int(os.environ.get("PREFLIGHT_BROAD_POOL", "200")) # union top-N from each signal
-_USE_DERIVED_BM25      = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "0") == "1"
-_USE_LEXICAL_CHANNELS  = os.environ.get("PREFLIGHT_USE_LEXICAL_CHANNELS", "0") == "1"
-_USE_CONTEXT_BM25      = os.environ.get("PREFLIGHT_USE_CONTEXT_BM25", "0") == "1"
-_USE_QUERY_DECOMPOSITION = os.environ.get("PREFLIGHT_USE_QUERY_DECOMPOSITION", "0") == "1"
+_USE_DERIVED_BM25      = os.environ.get("PREFLIGHT_USE_DERIVED_BM25", "1") == "1"
+_USE_LEXICAL_CHANNELS  = os.environ.get("PREFLIGHT_USE_LEXICAL_CHANNELS", "1") == "1"
+_USE_CONTEXT_BM25      = os.environ.get("PREFLIGHT_USE_CONTEXT_BM25", "1") == "1"
+_USE_QUERY_DECOMPOSITION = os.environ.get("PREFLIGHT_USE_QUERY_DECOMPOSITION", "1") == "1"
 _CONTEXT_WINDOW_SIZE   = int(os.environ.get("PREFLIGHT_CONTEXT_WINDOW", "3"))
-_CE_POOL_SIZE          = int(os.environ.get("PREFLIGHT_CE_POOL", "160"))   # candidates fed to CE (benchmark: 200, up from 120)
-_CE_TIMEOUT            = float(os.environ.get("PREFLIGHT_CE_TIMEOUT", "5.0")) # max seconds for CE (bigger model needs more)
+_CE_POOL_SIZE          = int(os.environ.get("PREFLIGHT_CE_POOL", "200"))   # candidates fed to CE (benchmark: 200, up from 120)
+_CE_TIMEOUT            = float(os.environ.get("PREFLIGHT_CE_TIMEOUT", "10.0")) # max seconds for CE (bigger model needs more)
 _CE_GUARD_K            = int(os.environ.get("PREFLIGHT_CE_GUARD_K", "40")) # min-rank guard after CE (0=disabled)
 _COVERAGE_K            = int(os.environ.get("PREFLIGHT_COVERAGE_K", "40")) # min-rank after scoring (0=disabled)
 _TEMPORAL_EDGE_DECAY   = 0.25   # strength decay per turn distance (linear)
@@ -220,17 +334,19 @@ _ENRICH_MIN_SIM        = 0.15   # minimum cosine similarity to existing fact bef
 # Benchmark mode: set to True to skip composite scoring, SM-2, MMR, graph expansion.
 # recall_ablation.py sets this directly after import if needed.
 # Default False = full production path with all scoring signals.
-_RETRIEVE_BENCHMARK = False
+# Override via PREFLIGHT_RETRIEVE_BENCHMARK env var.
+_RETRIEVE_BENCHMARK = os.environ.get("PREFLIGHT_RETRIEVE_BENCHMARK_MEMORY", "0") == "1"
 
 # Composite scoring weights — sum to 1.0. RRF is the dominant signal (0.60).
 # Recency/staleness/session_rec/freq provide metadata context.
 # When sessions are sparse (< 3 entries), session_rec weight shifts to RRF adaptively.
 # All overridable via env vars for tuning.
-_W_COMP_RRF        = float(os.environ.get("PREFLIGHT_W_RRF", "0.60"))
-_W_COMP_RECENCY    = float(os.environ.get("PREFLIGHT_W_RECENCY", "0.12"))
+_W_COMP_RRF        = float(os.environ.get("PREFLIGHT_W_RRF", "0.57"))
+_W_COMP_RECENCY    = float(os.environ.get("PREFLIGHT_W_RECENCY", "0.10"))
 _W_COMP_STALENESS  = float(os.environ.get("PREFLIGHT_W_STALENESS", "0.08"))
 _W_COMP_SESSION_REC = float(os.environ.get("PREFLIGHT_W_SESSION_REC", "0.12"))
 _W_COMP_FREQ       = float(os.environ.get("PREFLIGHT_W_FREQ", "0.08"))
+_W_COMP_PAGERANK   = float(os.environ.get("PREFLIGHT_W_PAGERANK", "0.05"))
 _W_ADAPTIVE_SESSION_MIN = 3  # if fewer sessions than this, merge session_rec weight into RRF
 
 # Step 7: Retrospective ENRICH (consolidate_memories) tuning constants.
@@ -820,46 +936,93 @@ def link_facts(
         conn.close()
 
 
-def get_related_facts(fact_id: int, depth: int = 1) -> list[dict]:
-    """BFS over the graph starting from fact_id, up to `depth` hops.
+def _compute_pagerank(project_id: str, damping: float = 0.85, iterations: int = 20) -> dict[int, float]:
+    """Compute PageRank on fact_relations graph.
 
-    depth=1 returns direct neighbours; depth=2 returns neighbours of neighbours.
-    Capped at 2 to avoid context explosion.
+    Returns dict mapping fact_id → normalised PageRank score (0-1).
+    Returns empty dict if no edges exist.
+    """
+    conn = init_db()
+    edges = conn.execute(
+        """SELECT fact_id_a, fact_id_b, strength FROM fact_relations
+        WHERE fact_id_a IN (SELECT id FROM facts WHERE project_id = ? AND superseded_at IS NULL)
+        AND fact_id_b IN (SELECT id FROM facts WHERE project_id = ? AND superseded_at IS NULL)""",
+        (project_id, project_id),
+    ).fetchall()
+    conn.close()
+
+    nodes: set[int] = set()
+    adj: dict[int, list[tuple[int, float]]] = {}
+    for a, b, strength in edges:
+        nodes.add(a)
+        nodes.add(b)
+        adj.setdefault(a, []).append((b, strength))
+        adj.setdefault(b, []).append((a, strength))
+
+    n = len(nodes)
+    if n == 0:
+        return {}
+
+    pr = {node: 1.0 / n for node in nodes}
+    for _ in range(iterations):
+        new_pr = {}
+        for node in nodes:
+            rank = (1.0 - damping) / n
+            for neighbor, strength in adj.get(node, []):
+                degree = len(adj.get(neighbor, []))
+                if degree > 0:
+                    rank += damping * pr[neighbor] * strength / degree
+            new_pr[node] = rank
+        pr = new_pr
+
+    max_pr = max(pr.values()) if pr else 1.0
+    return {k: v / max_pr for k, v in pr.items()}
+
+
+def get_related_facts(fact_id: int, depth: int = 2, min_strength: float = 0.3) -> list[dict]:
+    """BFS over graph with pruning by edge strength.
+
+    depth=2 max, returns neighbours sorted by path_strength descending.
     """
     depth = min(depth, 2)
     conn = init_db()
     visited: set[int] = {fact_id}
     results: list[dict] = []
-    queue: list[int] = [fact_id]
+    queue: list[tuple[int, float]] = [(fact_id, 1.0)]
 
-    for _ in range(depth):
-        next_queue: list[int] = []
-        for fid in queue:
+    for d in range(depth):
+        next_queue: list[tuple[int, float]] = []
+        for fid, path_strength in queue:
             rows = conn.execute(
                 """SELECT f.id, f.content, f.fact_type, r.relation, r.strength
-                   FROM fact_relations r
-                   JOIN facts f ON (
-                       CASE WHEN r.fact_id_a = ? THEN r.fact_id_b
-                            ELSE r.fact_id_a END = f.id
-                   )
-                   WHERE r.fact_id_a = ? OR r.fact_id_b = ?
-                   ORDER BY r.strength DESC""",
-                (fid, fid, fid),
+                FROM fact_relations r
+                JOIN facts f ON (
+                    CASE WHEN r.fact_id_a = ? THEN r.fact_id_b
+                    ELSE r.fact_id_a END = f.id
+                )
+                WHERE (r.fact_id_a = ? OR r.fact_id_b = ?)
+                AND r.strength >= ?
+                ORDER BY r.strength DESC""",
+                (fid, fid, fid, min_strength),
             ).fetchall()
             for row_id, content, fact_type, relation, strength in rows:
-                if row_id not in visited:
+                new_strength = path_strength * strength
+                if row_id not in visited and new_strength >= min_strength:
                     visited.add(row_id)
-                    next_queue.append(row_id)
+                    next_queue.append((row_id, new_strength))
                     results.append({
                         "id": row_id,
                         "content": content,
                         "fact_type": fact_type,
                         "relation": relation,
                         "strength": strength,
+                        "path_strength": new_strength,
+                        "hop": d + 1,
                     })
         queue = next_queue
 
     conn.close()
+    results.sort(key=lambda x: x["path_strength"], reverse=True)
     return results
 
 
@@ -1422,7 +1585,10 @@ def store_turn_window(
             except Exception:
                 pass  # never let extractor errors affect raw storage
 
-        _threading.Thread(target=_run_llm_extract, daemon=True).start()
+        _extract_thread = _threading.Thread(target=_run_llm_extract, daemon=True)
+        _extract_thread.start()
+        if _SYNC_EXTRACT:
+            _extract_thread.join(timeout=30.0)
     # Extract and store atomic SVO facts for higher-precision retrieval.
     # Skip during bulk ingestion (extract_svo=False) — spaCy is ~0.5s/window.
     if extract_svo:
@@ -1464,7 +1630,7 @@ def _expand_query_hyde(query: str, timeout_s: float = 5.0) -> str | None:
             {"role": "user", "content": query},
         ],
         "stream": False,
-        "options": {"num_predict": 128},
+        "options": {"num_predict": 128, "temperature": 0},
     }).encode()
     try:
         req = urllib.request.Request(
@@ -1681,6 +1847,7 @@ def retrieve_facts(
 
     # ── 2-X. Query decomposition ─────────────────────────────────────────
     sub_queries = _decompose_query(prompt) if _USE_QUERY_DECOMPOSITION else [prompt]
+    _query_type = _classify_query_type(prompt)
 
     emb_by_fid: dict[int, list] = {fid: emb for fid, _c, emb, *_ in rows}
     content_by_fid: dict[int, str] = {fid: content for fid, content, *_ in rows}
@@ -1850,25 +2017,26 @@ def retrieve_facts(
             except Exception:
                 pass
 
-        # RRF for this sub-query — accumulate max per fact across sub-queries
-        _w_vec     = _RRF_W.get("vec", 1.0)
-        _w_bm25    = _RRF_W.get("bm25", 1.0)
-        _w_entity  = _RRF_W.get("entity", 1.0)
-        _w_derived = _RRF_W.get("derived", 1.0)
-        _w_context = _RRF_W.get("context", 1.0)
-        for fid, *_ in rows:
-            s = _w_vec * (1.0 / (_RRF_K + sq_vec_rank.get(fid, n_facts)))
+        # RRF for this sub-query — accumulate max per fact across sub-queries.
+        # Query-type-weighted: uses per-type config from _RRF_CONFIGS.
+        _rrf_cfg = _RRF_CONFIGS.get(_query_type, _RRF_CONFIGS["default"])
+        _k = _rrf_cfg["k"]
+        for fid, _c, *_ in rows:
+            s = _rrf_cfg["ann_weight"] * (1.0 / (_k + sq_vec_rank.get(fid, n_facts)))
             if fid in sq_bm25_rank:
-                bm25_component = 1.0 / (_RRF_K + sq_bm25_rank[fid])
+                bm25_c = _rrf_cfg["bm25_weight"] * (1.0 / (_k + sq_bm25_rank[fid]))
                 if fid in sq_phrase_fids:
-                    bm25_component *= 1.5
-                s += _w_bm25 * bm25_component
+                    bm25_c *= 1.5
+                s += bm25_c
             if _USE_DERIVED_BM25 and fid in sq_derived_rank:
-                s += _w_derived * (1.0 / (_RRF_K + sq_derived_rank[fid]))
+                s += _rrf_cfg["derived_weight"] * (1.0 / (_k + sq_derived_rank[fid]))
             if _USE_CONTEXT_BM25 and fid in sq_context_rank:
-                s += _w_context * (1.0 / (_RRF_K + sq_context_rank[fid]))
+                s += _rrf_cfg["context_weight"] * (1.0 / (_k + sq_context_rank[fid]))
             if fid in sq_entity_rank:
-                s += _w_entity * (1.0 / (_RRF_K + sq_entity_rank[fid]))
+                s += _rrf_cfg["entity_weight"] * (1.0 / (_k + sq_entity_rank[fid]))
+            if _rrf_cfg.get("speaker_boost"):
+                if "user" in _c.lower() or "user said" in _c.lower() or "user:" in _c.lower():
+                    s *= 1.3
             if fid not in raw_rrf or s > raw_rrf[fid]:
                 raw_rrf[fid] = s
             # Track per-signal best ranks for broad pool (use first sub-query's ranks for simplicity)
@@ -1962,16 +2130,52 @@ def retrieve_facts(
         _broad_cands = [fid for fid, *_ in rows]
         _broad_set = set(_broad_cands)
 
-    _broad_sorted = sorted(_broad_cands, key=lambda f: raw_rrf.get(f, 0.0), reverse=True)
-    _tail_sorted = sorted(
-        (fid for fid, *_ in rows if fid not in _broad_set),
-        key=lambda f: raw_rrf.get(f, 0.0), reverse=True
-    )
-    _rerank_order = _broad_sorted + _tail_sorted
+    # Temporal query handling: chrono sort when query asks about time.
+    _chrono_sort = None
+    if _query_type == "temporal-reasoning":
+        temporal_exp = _expand_temporal_query(prompt)
+        if temporal_exp.get("chrono") and temporal_exp.get("sort"):
+            _chrono_sort = temporal_exp["sort"]
+
+    if _chrono_sort:
+        fid_list = list(raw_rrf.keys())
+        if fid_list:
+            placeholders = ','.join('?' * len(fid_list))
+            date_rows = conn.execute(
+                f"SELECT id, created_at FROM facts WHERE id IN ({placeholders})",
+                fid_list
+            ).fetchall()
+            fid_dates = {r[0]: r[1] for r in date_rows}
+            reverse = "DESC" in _chrono_sort
+            sorted_by_rrf = sorted(raw_rrf.items(), key=lambda x: x[1], reverse=True)
+            _broad_sorted = sorted(
+                (f for f in _broad_cands if f in raw_rrf),
+                key=lambda f: (raw_rrf.get(f, 0.0), fid_dates.get(f, "") or ""),
+                reverse=reverse,
+            )[:_BROAD_POOL]
+            # Tail: items in rows but not in broad_set, sorted by RRF (no chrono for tail)
+            _tail_sorted = sorted(
+                (fid for fid, *_ in rows if fid not in _broad_set),
+                key=lambda f: raw_rrf.get(f, 0.0), reverse=True
+            )
+            _rerank_order = _broad_sorted + _tail_sorted
+        else:
+            _broad_sorted = []
+            _tail_sorted = sorted(
+                (fid for fid, *_ in rows),
+                key=lambda f: raw_rrf.get(f, 0.0), reverse=True
+            )
+            _rerank_order = _tail_sorted
+    else:
+        _broad_sorted = sorted(_broad_cands, key=lambda f: raw_rrf.get(f, 0.0), reverse=True)
+        _tail_sorted = sorted(
+            (fid for fid, *_ in rows if fid not in _broad_set),
+            key=lambda f: raw_rrf.get(f, 0.0), reverse=True
+        )
+        _rerank_order = _broad_sorted + _tail_sorted
     _pre_score_order = list(_rerank_order) if _COVERAGE_K > 0 else None
 
     # ── Query-type routing ────────────────────────────────────────────────
-    _query_type = _classify_query_type(prompt)
     _is_temporal_query = any(w in prompt.lower() for w in _TEMPORAL_WORDS)
     _temporal_direction = "default"
     _ts_range = (0, 1)
@@ -2014,6 +2218,8 @@ def retrieve_facts(
             pass
 
         now = datetime.now(timezone.utc)
+        # Pre-compute PageRank for graph-based importance signal.
+        _pagerank_scores = _compute_pagerank(project_id)
         row_by_fid: dict[int, tuple] = {r[0]: r for r in rows}
         scored_all: list = []
         for fid in _rerank_order:
@@ -2041,7 +2247,8 @@ def retrieve_facts(
             if len(session_idx_map) < _W_ADAPTIVE_SESSION_MIN:
                 _w_session_use = 0.0
                 _w_rrf_use = _W_COMP_RRF + _W_COMP_SESSION_REC
-            score = _w_rrf_use * rrf + _W_COMP_RECENCY * recency + _W_COMP_STALENESS * staleness + _w_session_use * session_rec + _W_COMP_FREQ * freq
+            _pg = _pagerank_scores.get(fid, 0.0)
+            score = _w_rrf_use * rrf + _W_COMP_RECENCY * recency + _W_COMP_STALENESS * staleness + _w_session_use * session_rec + _W_COMP_FREQ * freq + _W_COMP_PAGERANK * _pg
             # Window demotion (adjustable via PREFLIGHT_WINDOW_DEMOTION, default 1.0 = no demotion).
             if ft == "window":
                 score *= _WINDOW_DEMOTION
