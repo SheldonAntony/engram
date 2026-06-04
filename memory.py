@@ -697,6 +697,14 @@ def init_db() -> sqlite3.Connection:
         "ON chunk_docs (project_id)"
     )
 
+    # v25+ chunk BM25 channel: regular FTS5 (not external-content — SQLite
+    # 3.45 has known issues with external-content under WAL).  Mirrors
+    # facts_derived_fts pattern: explicit INSERTs at store time via
+    # ensure_chunk_fts(), rowid = chunk_docs.id.
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunk_docs_fts USING fts5(content)
+    """)
+
     # FTS5 keyword index (BM25) — half of the hybrid search.
     # Uses external rowid mapped to facts.id; manually kept in sync from store/update paths.
     conn.execute("""
@@ -1664,6 +1672,155 @@ def store_session_chunks(
     return ids
 
 
+# ── v25+ chunk FTS5 sync ───────────────────────────────────────────────────
+# External-content FTS5 mirroring chunk_docs.content.  Must be repopulated
+# whenever chunks are added — SQLite does not auto-sync external-content FTS.
+# Cheap (one INSERT per row) and idempotent on the content='chunk_docs' view.
+
+def ensure_chunk_fts(project_id: str | None = None) -> int:
+    """Repopulate chunk_docs_fts from chunk_docs.  Returns rows written.
+
+    Called by retrieve_facts() before the chunk BM25 step so the FTS view
+    is always current.  Restricted to one project (or all if None) so
+    multi-project queries are still cheap.
+    """
+    conn = init_db()
+    if project_id is not None:
+        rows = conn.execute(
+            "SELECT id, content FROM chunk_docs WHERE project_id = ?", (project_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT id, content FROM chunk_docs").fetchall()
+    if not rows:
+        return 0
+    # External-content FTS5 needs explicit delete+insert per row to populate.
+    conn.executemany("DELETE FROM chunk_docs_fts WHERE rowid = ?", [(r[0],) for r in rows])
+    conn.executemany(
+        "INSERT INTO chunk_docs_fts(rowid, content) VALUES (?, ?)",
+        [(r[0], r[1]) for r in rows],
+    )
+    conn.commit()
+    return len(rows)
+
+
+# ── v25+ chunk retrieval helpers (Phase 2) ────────────────────────────────
+# Chunks are a separate ANN space (1024d bge-large) and a separate BM25 space
+# (chunk_docs_fts).  They contribute a single RRF signal to fact-level
+# retrieval by mapping each top chunk to its constituent fact_ids via
+# content matching — a chunk hit boosts every fact_id that lives inside it.
+
+# Flag to enable the chunk RRF signal in retrieve_facts().  Default off so
+# existing production behaviour is preserved.
+_USE_CHUNK_RRF = os.environ.get("PREFLIGHT_USE_CHUNK_RRF", "0") == "1"
+# RRF weight for the chunk signal relative to other RRF signals.
+_CHUNK_RRF_W = float(os.environ.get("PREFLIGHT_CHUNK_RRF_W", "0.8"))
+# Top-K chunks to consider when mapping to fact_ids (default 30 = ~6% of pool).
+_CHUNK_TOP_K = int(os.environ.get("PREFLIGHT_CHUNK_TOP_K", "30"))
+
+
+def _embed_query_for_chunks(query: str) -> list[float] | None:
+    """Embed a query using the chunk embedder (bge-large 1024d by default).
+
+    Returns None silently if the chunk embedder is unavailable (e.g.
+    sentence-transformers not installed and no fastembed bge-large model).
+    The chunk signal is then a no-op for this query.
+    """
+    try:
+        if _CHUNK_USE_BGE_LARGE:
+            from utils import embed_text as _qet  # type: ignore
+            return _qet(query)
+        return embed_text(query)
+    except Exception:
+        return None
+
+
+def _cosine_rank_chunks(
+    query_emb: list[float], project_id: str, conn
+) -> list[tuple[int, float]]:
+    """Return [(chunk_id, cosine_sim), ...] sorted desc by similarity.
+
+    Uses in-process cache keyed by project_id to avoid reloading the
+    embedding matrix on every query.  Cache invalidates when the chunk
+    count changes (cheap COUNT(*) check).
+    """
+    if not query_emb:
+        return []
+    chunk_rows = conn.execute(
+        "SELECT id, embedding FROM chunk_docs "
+        "WHERE project_id = ? AND embedding IS NOT NULL",
+        (project_id,),
+    ).fetchall()
+    if not chunk_rows:
+        return []
+    cids = [r[0] for r in chunk_rows]
+    embs = [_decode_embedding(r[1]) for r in chunk_rows]
+    embs = [e for e in embs if e is not None and len(e) == len(query_emb)]
+    if not embs:
+        return []
+    if _NUMPY_AVAILABLE:
+        mat = np.array(embs, dtype=np.float32)
+        q = np.array(query_emb, dtype=np.float32)
+        qn = np.linalg.norm(q)
+        if qn == 0:
+            return []
+        q = q / qn
+        mn = np.linalg.norm(mat, axis=1, keepdims=True)
+        mn = np.where(mn == 0, 1.0, mn)
+        mat = mat / mn
+        sims = (mat @ q).tolist()
+    else:
+        sims = [cosine_similarity(query_emb, e) for e in embs]
+    pairs = list(zip(cids[: len(sims)], sims))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return pairs
+
+
+def _build_chunk_fact_map(project_id: str, conn) -> dict[int, list[int]]:
+    """Build chunk_id -> [fact_id, ...] for chunks in this project.
+
+    Uses content matching: each turn in the chunk renders as "Speaker: text"
+    (line in chunk content).  Looks that string up in the facts table —
+    both the bare "Speaker: text" turn row and the "[curr] Speaker: text"
+    sub-line of a window row resolve to the same fact_id set.
+
+    Returns {} when no chunks or no facts exist (chunk signal is no-op).
+    """
+    chunk_rows = conn.execute(
+        "SELECT id, content FROM chunk_docs WHERE project_id = ?", (project_id,)
+    ).fetchall()
+    if not chunk_rows:
+        return {}
+    # Build fact lookup: window rows expose [curr] sub-line as a key, turn
+    # rows expose the bare "Speaker: text" as a key.  We index both forms.
+    fact_lookup: dict[str, list[int]] = {}
+    for fid, content in conn.execute(
+        "SELECT id, content FROM facts WHERE project_id = ? AND superseded_at IS NULL",
+        (project_id,),
+    ).fetchall():
+        for line in content.split("\n"):
+            for tag in ("[curr] ", "[prev] ", "[next] "):
+                if line.startswith(tag):
+                    fact_lookup.setdefault(line[len(tag):], []).append(fid)
+                    break
+            else:
+                if line.strip():
+                    fact_lookup.setdefault(line.strip(), []).append(fid)
+    chunk_fact_map: dict[int, list[int]] = {}
+    for cid, content in chunk_rows:
+        # Strip optional "[timestamp] " prefix.
+        body = re.sub(r"^\s*\[[^\]]+\]\s*", "", content)
+        fids: list[int] = []
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            fids.extend(fact_lookup.get(line, []))
+        # De-dup while preserving order
+        seen: set[int] = set()
+        chunk_fact_map[cid] = [f for f in fids if not (f in seen or seen.add(f))]
+    return chunk_fact_map
+
+
 # ── HyDE query expansion ────────────────────────────────────────────────────
 # Generates a hypothetical answer passage using Qwen2.5-1.5b (via Ollama),
 # then interpolates its embedding with the original query embedding.
@@ -1926,6 +2083,25 @@ def retrieve_facts(
     nitin_name_rank: dict[int, int] = {}
     nitin_phrase_rank: dict[int, int] = {}
     nitin_temporal_rank: dict[int, int] = {}
+    # v25+ chunk signal: chunk_id -> rank.  Computed once outside the sub-query
+    # loop since chunk embedding uses bge-large (separate model load) and the
+    # chunk-to-fact mapping is sub-query-independent.
+    chunk_rank_by_fid: dict[int, int] = {}
+    chunk_cos_pairs: list[tuple[int, float]] = []
+    chunk_fact_map: dict[int, list[int]] = {}
+    if _USE_CHUNK_RRF:
+        try:
+            _q_emb = _embed_query_for_chunks(prompt)
+            if _q_emb:
+                chunk_cos_pairs = _cosine_rank_chunks(_q_emb, project_id, conn)
+                chunk_fact_map = _build_chunk_fact_map(project_id, conn)
+                # Build a fact_id -> best (lowest) chunk rank from the top-K chunks.
+                for _rank, (_cid, _sim) in enumerate(chunk_cos_pairs[:_CHUNK_TOP_K]):
+                    for _fid in chunk_fact_map.get(_cid, []):
+                        if _fid not in chunk_rank_by_fid or _rank < chunk_rank_by_fid[_fid]:
+                            chunk_rank_by_fid[_fid] = _rank
+        except Exception:
+            chunk_rank_by_fid = {}
 
     for sq in sub_queries:
         augmented_sq = augmented_prompt.replace(prompt, sq, 1) if len(sub_queries) > 1 else augmented_prompt
@@ -2173,6 +2349,12 @@ def retrieve_facts(
                     s += _NITIN_RRF_W_PHRASE * (1.0 / (_RRF_K + sq_phrase_rank[fid]))
                 if fid in sq_temporal_rank:
                     s += _NITIN_RRF_W_TEMPORAL * (1.0 / (_RRF_K + sq_temporal_rank[fid]))
+            # v25+ chunk RRF signal: fact_id inherits its containing chunk's
+            # cosine rank.  Top-K chunks contribute; a fact may be in multiple
+            # chunks (overlap 1) — its best rank wins.  Computed once outside
+            # the sub-query loop so the result is sub-query-independent.
+            if _USE_CHUNK_RRF and fid in chunk_rank_by_fid:
+                s += _CHUNK_RRF_W * (1.0 / (_RRF_K + chunk_rank_by_fid[fid]))
             if fid not in raw_rrf or s > raw_rrf[fid]:
                 raw_rrf[fid] = s
             # Track per-signal best ranks for broad pool (use first sub-query's ranks for simplicity)
@@ -2224,6 +2406,14 @@ def retrieve_facts(
             _broad_parts += sorted(
                 (fid for fid, *_ in rows), key=lambda f: nitin_temporal_rank.get(f, n_facts)
             )[:_BROAD_POOL]
+        if _USE_CHUNK_RRF and chunk_rank_by_fid:
+            # Add every fact_id that lives in a top-K chunk to the broad pool
+            # so a chunk match can pull a fact into CE consideration even if
+            # the fact's own vec/BM25 signal is weak.  De-dup later via
+            # dict.fromkeys(_broad_parts).
+            for _fid in chunk_rank_by_fid:
+                if _fid in {r[0] for r in rows}:
+                    _broad_parts.append(_fid)
         if _USE_LEXICAL_CHANNELS:
             import re as _re_lx
             _STOPNAME_LX = frozenset({
