@@ -729,6 +729,7 @@ def init_db() -> sqlite3.Connection:
     _ensure_column(conn, "facts",      "created_at",      "TIMESTAMP", "CURRENT_TIMESTAMP")
     _ensure_column(conn, "facts",      "fact_type",       "TEXT",      "'note'")
     _ensure_column(conn, "facts",      "valid_from",        "REAL",      "(unixepoch())")
+    _ensure_column(conn, "facts",      "valid_to",          "REAL",      "NULL")
     _ensure_column(conn, "facts",      "superseded_at",     "REAL",      "NULL")
     _ensure_column(conn, "facts",      "source_session",    "TEXT",      "NULL")
     _ensure_column(conn, "facts",      "source_hash",       "TEXT",      "NULL")
