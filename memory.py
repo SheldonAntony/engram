@@ -60,6 +60,19 @@ except Exception:
 # Silently no-ops when Ollama is not available; raw storage is never affected.
 _USE_LLM_EXTRACTOR = os.environ.get("PREFLIGHT_USE_LLM_EXTRACTOR", "0") == "1"
 
+# v25+ hybrid: chunked turn storage (Nitin-Gupta1109/engram) for multi-hop recall.
+# _CHUNK_STORE off by default so existing ingest paths are unchanged.  When on,
+# store_session_chunks() creates parallel chunk_doc rows that preserve 6-turn
+# context (with overlap 1) — multi-hop Qs ("When did X happen to Y?") can match
+# across the chunk rather than failing on isolated fact rows.
+_CHUNK_STORE          = os.environ.get("PREFLIGHT_CHUNK_STORE",          "0") == "1"
+_CHUNK_MAX_TURNS      = int(os.environ.get("PREFLIGHT_CHUNK_MAX_TURNS", "6"))
+_CHUNK_OVERLAP        = int(os.environ.get("PREFLIGHT_CHUNK_OVERLAP",   "1"))
+_CHUNK_USE_BGE_LARGE  = os.environ.get("PREFLIGHT_CHUNK_USE_BGE_LARGE", "1") == "1"
+# When on, prefix chunk text with the session timestamp (Nitin's pattern —
+# helps both dense and BM25 retrieval for temporal Qs).
+_CHUNK_PREFIX_TS      = os.environ.get("PREFLIGHT_CHUNK_PREFIX_TS",     "1") == "1"
+
 try:
     from extractor import extract_entities as _extract_entities
 except (ImportError, AttributeError):
@@ -653,6 +666,36 @@ def init_db() -> sqlite3.Connection:
             enriched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # v25+ hybrid: chunked turn storage (Nitin pattern).  Each row is a 6-turn
+    # window (overlap 1) rendered with speaker name + optional timestamp prefix,
+    # embedded whole via bge-large (1024d) so multi-hop Qs can match across the
+    # chunk.  Parallel to the facts table — fact-level retrieval still works
+    # unchanged; chunk-level retrieval is a Phase 2 add.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunk_docs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id   TEXT    NOT NULL,
+            project_id   TEXT    NOT NULL,
+            chunk_index  INTEGER,
+            turn_start   INTEGER,
+            turn_end     INTEGER,
+            content      TEXT    NOT NULL,
+            embedding    BLOB,
+            fact_type    TEXT    DEFAULT 'chunk',
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            entities     TEXT,
+            source_hash  TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunk_session "
+        "ON chunk_docs (session_id, chunk_index)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunk_project "
+        "ON chunk_docs (project_id)"
+    )
 
     # FTS5 keyword index (BM25) — half of the hybrid search.
     # Uses external rowid mapped to facts.id; manually kept in sync from store/update paths.
@@ -1493,6 +1536,132 @@ def store_turn_window(
         except Exception:
             pass
     return window_fid
+
+
+# ── Chunked turn storage (v25+ hybrid — Nitin-Gupta1109/engram pattern) ───────
+# Parallel to the fact-level store_turn_window().  Where store_turn_window()
+# stores a 3-turn [prev][curr][next] window (with [curr] embedded) for ANN
+# recall, store_session_chunks() stores a 6-turn chunk (overlap 1) with the
+# WHOLE chunk embedded, so multi-hop Qs that span 2-4 turns can match the
+# chunk in a single ANN hit.  Retrieval-side wiring is Phase 2; this is
+# storage-only — opt-in via PREFLIGHT_CHUNK_STORE=1 so existing ingest is
+# never silently changed.
+
+def _chunk_session_turns(
+    turns: list, max_turns: int = 6, overlap: int = 1
+) -> list[tuple[int, int]]:
+    """Split a turn list into overlapping (start, end) index pairs.
+
+    Default 6 turns/chunk with overlap 1 — Nitin's setting, validated on
+    LoCoMo.  Short sessions (<=max_turns) yield a single chunk.
+    """
+    if len(turns) <= max_turns:
+        return [(0, len(turns))]
+    chunks: list[tuple[int, int]] = []
+    start = 0
+    while start < len(turns):
+        end = min(start + max_turns, len(turns))
+        chunks.append((start, end))
+        next_start = end - overlap
+        if next_start <= start:
+            next_start = start + 1
+        start = next_start
+    return chunks
+
+
+def _render_session_chunk(
+    turns: list, start: int, end: int, timestamp: str = "",
+) -> str:
+    """Render a chunk as multi-line text with optional timestamp prefix.
+
+    Each turn becomes "Speaker: text" on its own line so the dense embedding
+    sees the full conversational context across all 6 turns.  The timestamp
+    prefix embeds the session date into the text so temporal Qs ("when did
+    X happen in July?") match via both dense and BM25 retrieval.
+    """
+    prefix = f"[{timestamp}] " if timestamp else ""
+    lines = []
+    for i in range(start, end):
+        t = turns[i]
+        speaker = str(t.get("speaker", "?"))
+        text    = str(t.get("text", ""))
+        if not text.strip():
+            continue
+        lines.append(f"{speaker}: {text}")
+    return prefix + "\n".join(lines)
+
+
+def store_session_chunks(
+    project_id: str,
+    session_id: str,
+    turns: list,
+    timestamp: str = "",
+    chunk_max_turns: int | None = None,
+    overlap: int | None = None,
+) -> list[int]:
+    """Store chunked turn documents for context-preserving multi-hop retrieval.
+
+    Parallel to store_turn_window(); callers typically invoke both per session.
+    Each chunk is rendered with speaker name + optional session timestamp
+    prefix, embedded whole (default 1024d via bge-large, override via
+    PREFLIGHT_CHUNK_USE_BGE_LARGE=0 to use the current production embedder),
+    and stored in chunk_docs.
+
+    Returns the list of chunk_doc ids created (in chunk order).
+
+    No-ops (returns []) when _CHUNK_STORE is False or the turn list is empty,
+    so callers can invoke unconditionally without env-gating.
+    """
+    if not _CHUNK_STORE:
+        return []
+    if not turns:
+        return []
+    chunk_max_turns = chunk_max_turns if chunk_max_turns is not None else _CHUNK_MAX_TURNS
+    overlap         = overlap         if overlap         is not None else _CHUNK_OVERLAP
+    ts_prefix       = timestamp       if _CHUNK_PREFIX_TS else ""
+
+    chunks = _chunk_session_turns(turns, chunk_max_turns, overlap)
+    rendered = [_render_session_chunk(turns, s, e, ts_prefix) for s, e in chunks]
+    # Speaker list per chunk — used as `entities` for downstream overlap signals.
+    chunk_speakers: list[list[str]] = []
+    for s, e in chunks:
+        speakers: list[str] = []
+        for i in range(s, e):
+            spk = str(turns[i].get("speaker", "")).strip()
+            if spk and spk not in speakers:
+                speakers.append(spk)
+        chunk_speakers.append(speakers)
+
+    # Batch-embed all chunks in one model call (bge-large when configured).
+    # When bge-large is requested but sentence-transformers isn't installed,
+    # fall back to the production embedder so ingest never crashes.
+    if _CHUNK_USE_BGE_LARGE:
+        try:
+            from utils import embed_texts_batch as _uemb  # type: ignore
+            vecs = _uemb(rendered)
+        except Exception:
+            vecs = [embed_text(t) for t in rendered]
+    else:
+        vecs = [embed_text(t) for t in rendered]
+
+    conn = init_db()
+    ids: list[int] = []
+    for (s, e), text, emb, speakers in zip(chunks, rendered, vecs, chunk_speakers):
+        if emb is None:
+            continue
+        source_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+        emb_blob = _encode_embedding(emb)
+        cur = conn.execute(
+            """INSERT INTO chunk_docs
+               (session_id, project_id, chunk_index, turn_start, turn_end,
+                content, embedding, fact_type, entities, source_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'chunk', ?, ?)""",
+            (session_id, project_id, len(ids), s, e, text, emb_blob,
+             json.dumps(speakers), source_hash),
+        )
+        ids.append(cur.lastrowid)
+    conn.commit()
+    return ids
 
 
 # ── HyDE query expansion ────────────────────────────────────────────────────
