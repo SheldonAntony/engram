@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "engram-search"
+version = "0.1.7"
+description = "High-recall conversational memory retrieval. 98% R@5 on LongMemEval, 94% on LoCoMo — no LLM required. Local-first, cloud-ready."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "Nitin Gupta", email = "nmittal1109@gmail.com" }]
+keywords = ["memory", "retrieval", "conversational-ai", "embeddings", "bm25", "faiss", "rag", "search", "semantic-search", "long-term-memory"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Text Processing :: Linguistic",
+]
+
+dependencies = [
+    "sentence-transformers>=3.0",
+    "faiss-cpu>=1.7",
+    "rank-bm25>=0.2",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://engram-search.com"
+Repository = "https://github.com/Nitin-Gupta1109/engram"
+Issues = "https://github.com/Nitin-Gupta1109/engram/issues"
+Changelog = "https://github.com/Nitin-Gupta1109/engram/releases"
+
+[project.optional-dependencies]
+cloud = [
+    "qdrant-client>=1.9",
+]
+rerank = [
+    "sentence-transformers>=3.0",
+]
+bench = [
+    "tqdm>=4.60",
+]
+mcp = [
+    "mcp>=1.0",
+]
+dev = [
+    "engram-search[cloud,rerank,bench,mcp]",
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+all = ["engram-search[dev]"]
+
+[project.scripts]
+engram = "engram.cli:main"
+engram-mcp = "engram.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["engram"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
