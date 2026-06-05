@@ -213,5 +213,87 @@ def get_cross_encoder():
     return _cross_encoder
 
 
+# ── v25+ chunk embedder (always-bge-large) ──────────────────────────────────
+# Separate from the production embedder (which is ENGRAM_EMBED_MODEL-driven).
+# Chunks need 1024d regardless of fact embedder dim so the chunk→query cosine
+# works without dim-match logic at retrieval time.  Lazy-loaded once, cached
+# in a module-level variable; never loaded if PREFLIGHT_CHUNK_USE_BGE_LARGE=0.
+
+_bge_large_model = None
+_bge_large_tried = False
+
+
+def _get_bge_large_model():
+    """Lazy-load bge-large-en-v1.5 (1024d) for chunk embeddings.
+    Returns None silently if sentence-transformers is missing or load fails.
+    Cached so we only pay the ~1.3GB load cost once per process.
+    """
+    global _bge_large_model, _bge_large_tried
+    if not _bge_large_tried:
+        _bge_large_tried = True
+        try:
+            from sentence_transformers import SentenceTransformer  # lazy
+            _bge_large_model = SentenceTransformer(_BGE_LARGE_NAME)
+        except Exception:
+            _bge_large_model = None
+    return _bge_large_model
+
+
+def embed_text_bge_large(text: str) -> list[float] | None:
+    """Embed text with bge-large (1024d) — used for chunks when
+    PREFLIGHT_CHUNK_USE_BGE_LARGE=1.  Returns None on model load failure
+    so callers can fall back gracefully.
+
+    BGE asymmetric retrieval: queries get the standard prefix, documents do not.
+    """
+    model = _get_bge_large_model()
+    if model is None:
+        return None
+    try:
+        prepared = _prepare_query(text, _BGE_LARGE_NAME) if text else text
+        vec = model.encode(prepared, normalize_embeddings=False)
+        return _normalize(vec)
+    except Exception:
+        return None
+
+
+def embed_texts_batch_bge_large(texts: list) -> list:
+    """Batch embed with bge-large.  Returns list of 1024d vectors (or None
+    entries on failure).  Falls back to per-text embed_text_bge_large() when
+    any text exceeds bge's max_seq_length (need chunked mean-pool).
+    """
+    model = _get_bge_large_model()
+    if model is None:
+        return [None] * len(texts)
+    if not texts:
+        return []
+    max_chars = 2048
+    result: list = [None] * len(texts)
+    try:
+        # Split into short (batchable) and long (need chunked pooling)
+        short_idx = [i for i, t in enumerate(texts) if len(t) <= max_chars]
+        long_idx  = [i for i, t in enumerate(texts) if len(t) >  max_chars]
+        if short_idx:
+            short_texts = [_prepare_query(texts[i], _BGE_LARGE_NAME)
+                           if texts[i] else texts[i] for i in short_idx]
+            # bge-large is 1.3GB; on CPU batch_size=32 keeps latency low
+            # without OOMing (we already use 1.3GB for the model weights).
+            vecs = model.encode(short_texts, normalize_embeddings=False,
+                                batch_size=32, show_progress_bar=False)
+            for k, i in enumerate(short_idx):
+                result[i] = _normalize(vecs[k])
+        if long_idx:
+            import numpy as _np
+            for i in long_idx:
+                chunks = _chunk_text(texts[i], max_chars, overlap=200)
+                cvs = model.encode(chunks, normalize_embeddings=False,
+                                   batch_size=16, show_progress_bar=False)
+                vec = _np.mean(_np.array([v.tolist() for v in cvs]), axis=0)
+                result[i] = _normalize(vec)
+    except Exception:
+        return [None] * len(texts)
+    return result
+
+
 def get_cross_encoder_name() -> str:
     return _CE_MODEL_NAME

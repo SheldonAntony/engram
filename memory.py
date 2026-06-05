@@ -1646,8 +1646,12 @@ def store_session_chunks(
     # fall back to the production embedder so ingest never crashes.
     if _CHUNK_USE_BGE_LARGE:
         try:
-            from utils import embed_texts_batch as _uemb  # type: ignore
-            vecs = _uemb(rendered)
+            from utils import embed_texts_batch_bge_large as _uemb_bl  # type: ignore
+            vecs = _uemb_bl(rendered)
+            # If bge-large load failed (None entries), fall back to prod embedder
+            if any(v is None for v in vecs):
+                vecs = [embed_text(t) if v is None else v
+                        for t, v in zip(rendered, vecs)]
         except Exception:
             vecs = [embed_text(t) for t in rendered]
     else:
@@ -1725,10 +1729,15 @@ def _embed_query_for_chunks(query: str) -> list[float] | None:
     Returns None silently if the chunk embedder is unavailable (e.g.
     sentence-transformers not installed and no fastembed bge-large model).
     The chunk signal is then a no-op for this query.
+
+    v25+ Phase 3: When _CHUNK_USE_BGE_LARGE=1, ALWAYS use bge-large regardless
+    of ENGRAM_EMBED_MODEL — chunk embeddings and chunk query embeddings must
+    share the same model.  Previously this respected ENGRAM_EMBED_MODEL which
+    caused a dim mismatch and silently disabled the chunk signal.
     """
     try:
         if _CHUNK_USE_BGE_LARGE:
-            from utils import embed_text as _qet  # type: ignore
+            from utils import embed_text_bge_large as _qet  # type: ignore
             return _qet(query)
         return embed_text(query)
     except Exception:
