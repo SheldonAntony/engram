@@ -2129,10 +2129,24 @@ def retrieve_facts(
                     _alpha * a + (1.0 - _alpha) * b
                     for a, b in zip(sq_emb, _hyde_emb)
                 ]
-        sq_vec_scored = sorted(
-            ((cosine_similarity(sq_emb, emb), fid) for fid, emb in emb_by_fid.items()),
-            reverse=True,
-        )
+        if _NUMPY_AVAILABLE and emb_by_fid:
+            _fids = list(emb_by_fid.keys())
+            _embs_np = np.array(list(emb_by_fid.values()), dtype=np.float32)
+            _qvec = np.array(sq_emb, dtype=np.float32)
+            _qnorm = np.linalg.norm(_qvec)
+            if _qnorm > 0:
+                _qvec = _qvec / _qnorm
+            _norms = np.linalg.norm(_embs_np, axis=1, keepdims=True)
+            _norms = np.where(_norms == 0, 1.0, _norms)
+            _embs_normed = _embs_np / _norms
+            _cos_scores = _embs_normed @ _qvec
+            _cos_order = np.argsort(-_cos_scores)
+            sq_vec_scored = [(_cos_scores[int(i)], _fids[int(i)]) for i in _cos_order]
+        else:
+            sq_vec_scored = sorted(
+                ((cosine_similarity(sq_emb, emb), fid) for fid, emb in emb_by_fid.items()),
+                reverse=True,
+            )
         sq_vec_rank: dict[int, int] = {fid: rank for rank, (_, fid) in enumerate(sq_vec_scored)}
 
         # BM25
@@ -2744,29 +2758,88 @@ def retrieve_facts(
     # The CE has already seen the true top-20 by relevance, so MMR here only removes
     # near-duplicate results from the final returned set.
     if not _RETRIEVE_BENCHMARK and len(scored) > 5:
-        selected_embs: list = []
-        mmr_selected: list = []
-        remaining = list(scored)
-        while remaining and len(mmr_selected) < 20:
-            best_ms, best_row = -1e9, None
-            for row in remaining:
-                cand_emb = emb_by_fid.get(row[1])
-                if cand_emb is None:
-                    continue
-                rel = cosine_similarity(prompt_emb_raw, cand_emb)
-                redundancy = max(
-                    (cosine_similarity(cand_emb, s) for s in selected_embs),
-                    default=0.0,
-                )
-                ms = _MMR_LAMBDA_POST_CE * rel - (1.0 - _MMR_LAMBDA_POST_CE) * redundancy
-                if ms > best_ms:
-                    best_ms, best_row = ms, row
-            if best_row is None:
-                break
-            mmr_selected.append(best_row)
-            selected_embs.append(emb_by_fid[best_row[1]])
-            remaining.remove(best_row)
-        scored = mmr_selected + remaining
+        if _NUMPY_AVAILABLE:
+            # Vectorized MMR: pre-compute all rel scores, then greedy select
+            _mmr_fids = [r[1] for r in scored]
+            _mmr_embs = [emb_by_fid.get(fid) for fid in _mmr_fids]
+            _valid = [(i, e) for i, e in enumerate(_mmr_embs) if e is not None]
+            if _valid:
+                _vi, _ve = zip(*_valid)
+                _ve_np = np.array(_ve, dtype=np.float32)
+                _q_np = np.array(prompt_emb_raw, dtype=np.float32)
+                _qnorm = np.linalg.norm(_q_np)
+                if _qnorm > 0:
+                    _q_np = _q_np / _qnorm
+                _norms = np.linalg.norm(_ve_np, axis=1, keepdims=True)
+                _norms = np.where(_norms == 0, 1.0, _norms)
+                _ve_normed = _ve_np / _norms
+                _rel_scores = _ve_normed @ _q_np  # shape (N,)
+
+                _selected_idx = []
+                _selected_embs_list = []
+                _remaining_mask = np.ones(len(_valid), dtype=bool)
+                mmr_fids_ordered = []
+                for _ in range(min(20, len(_valid))):
+                    best_ms, best_local = -1e9, -1
+                    for _li in range(len(_valid)):
+                        if not _remaining_mask[_li]:
+                            continue
+                        _rel = float(_rel_scores[_li])
+                        if _selected_embs_list:
+                            _sel_np = np.array(_selected_embs_list, dtype=np.float32)
+                            _cand = _ve_np[_li]
+                            _cnorm = np.linalg.norm(_cand)
+                            if _cnorm > 0:
+                                _cand_n = _cand / _cnorm
+                            else:
+                                _cand_n = _cand
+                            _snorms = np.linalg.norm(_sel_np, axis=1, keepdims=True)
+                            _snorms = np.where(_snorms == 0, 1.0, _snorms)
+                            _sel_normed = _sel_np / _snorms
+                            _redun = float(np.max(_sel_normed @ _cand_n))
+                        else:
+                            _redun = 0.0
+                        _ms = _MMR_LAMBDA_POST_CE * _rel - (1.0 - _MMR_LAMBDA_POST_CE) * _redun
+                        if _ms > best_ms:
+                            best_ms = _ms
+                            best_local = _li
+                    if best_local < 0:
+                        break
+                    _remaining_mask[best_local] = False
+                    _selected_idx.append(best_local)
+                    _selected_embs_list.append(_ve_np[best_local])
+                    mmr_fids_ordered.append(_mmr_fids[_vi[best_local]])
+                # Append remaining in original order
+                for _li in range(len(_valid)):
+                    if _remaining_mask[_li]:
+                        mmr_fids_ordered.append(_mmr_fids[_vi[_li]])
+                # Rebuild scored with original row data
+                _fid_to_row = {r[1]: r for r in scored}
+                scored = [_fid_to_row[fid] for fid in mmr_fids_ordered if fid in _fid_to_row]
+        else:
+            selected_embs: list = []
+            mmr_selected: list = []
+            remaining = list(scored)
+            while remaining and len(mmr_selected) < 20:
+                best_ms, best_row = -1e9, None
+                for row in remaining:
+                    cand_emb = emb_by_fid.get(row[1])
+                    if cand_emb is None:
+                        continue
+                    rel = cosine_similarity(prompt_emb_raw, cand_emb)
+                    redundancy = max(
+                        (cosine_similarity(cand_emb, s) for s in selected_embs),
+                        default=0.0,
+                    )
+                    ms = _MMR_LAMBDA_POST_CE * rel - (1.0 - _MMR_LAMBDA_POST_CE) * redundancy
+                    if ms > best_ms:
+                        best_ms, best_row = ms, row
+                if best_row is None:
+                    break
+                mmr_selected.append(best_row)
+                selected_embs.append(emb_by_fid[best_row[1]])
+                remaining.remove(best_row)
+            scored = mmr_selected + remaining
 
     # Stage 3: post-MMR position (now after CE).
     if _gold_fid is not None:
